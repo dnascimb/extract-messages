@@ -683,14 +683,14 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape')document.ge
     for msg in messages:
         rtype = msg.get("reaction_type")
         if rtype in REACTION_EMOJI:
-            target = msg["reaction_target"]
+            target = msg.get("reaction_target") or ""
             key = (target, rtype, msg["sender"])
             if target and key not in seen:
                 seen.add(key)
                 reactions_map.setdefault(target, []).append(REACTION_EMOJI[rtype])
         elif rtype and 3000 <= rtype <= 3005:
             # Removed reaction — cancel it
-            target = msg["reaction_target"]
+            target = msg.get("reaction_target") or ""
             original = rtype - 1000
             key = (target, original, msg["sender"])
             seen.add(key)  # prevent the original from being re-added
@@ -875,22 +875,21 @@ def main():
 
     # ── Fetch messages ──
     if is_incremental:
-        new_msgs = fetch_messages(conn, contact, since_id=last_id)
-        if not new_msgs:
-            print("  Already up to date — no new messages.\n")
-            return
         existing = json.loads(existing_json.read_text())
-        print(f"  Found {len(new_msgs)} new message(s) "
-              f"({len(existing) + len(new_msgs):,} total).")
-        if args.no_reactions:
-            new_msgs = [m for m in new_msgs if not m["is_reaction"]]
-        new_atts = sum(len(m["attachments"]) for m in new_msgs)
-        if new_atts:
-            print("  Copying new attachments…")
-            new_msgs = copy_attachments(new_msgs, out_dir / "attachments")
-        if not args.no_link_previews and args.format in ("all", "html"):
-            new_msgs, preview_cache = fetch_link_previews(new_msgs, out_dir, preview_cache)
-        messages = existing + new_msgs
+        new_msgs = fetch_messages(conn, contact, since_id=last_id)
+        if new_msgs:
+            print(f"  Found {len(new_msgs)} new message(s) "
+                  f"({len(existing) + len(new_msgs):,} total).")
+            if args.no_reactions:
+                new_msgs = [m for m in new_msgs if not m["is_reaction"]]
+            new_atts = sum(len(m["attachments"]) for m in new_msgs)
+            if new_atts:
+                print("  Copying new attachments…")
+                new_msgs = copy_attachments(new_msgs, out_dir / "attachments")
+            messages = existing + new_msgs
+        else:
+            print(f"  No new messages — regenerating outputs ({len(existing):,} total).")
+            messages = existing
     else:
         messages = fetch_messages(conn, contact)
         if not messages:
@@ -904,8 +903,10 @@ def main():
         if atts:
             print("  Copying attachments…")
             messages = copy_attachments(messages, out_dir / "attachments")
-        if not args.no_link_previews and args.format in ("all", "html"):
-            messages, preview_cache = fetch_link_previews(messages, out_dir, preview_cache)
+
+    # ── Link previews — always run on full set so cache gaps get filled ──
+    if not args.no_link_previews and args.format in ("all", "html"):
+        messages, preview_cache = fetch_link_previews(messages, out_dir, preview_cache)
 
     # ── Save state ──
     state["last_message_id"] = max(m["message_id"] for m in messages)
