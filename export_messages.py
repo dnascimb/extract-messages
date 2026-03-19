@@ -106,7 +106,34 @@ def list_contacts(conn: sqlite3.Connection):
         print(f"{r['contact']:<35} {name:<30} {r['message_count']:>8}")
     print(f"\n{len(rows)} conversation(s) found.\n")
 
+def fetch_all_message_ids(conn: sqlite3.Connection, contact: str) -> set[int]:
+    """Return the set of all message ROWIDs for the given contact. Fast — integers only."""
+    rows = conn.execute("""
+        SELECT DISTINCT m.ROWID FROM message m
+        JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+        JOIN chat c                ON cmj.chat_id = c.ROWID
+        JOIN chat_handle_join chj  ON c.ROWID = chj.chat_id
+        JOIN handle h              ON chj.handle_id = h.ROWID
+        WHERE h.id = ?
+    """, (contact,)).fetchall()
+    return {r[0] for r in rows}
+
+def fetch_messages_by_ids(conn: sqlite3.Connection, contact: str, ids: set[int]) -> list[dict]:
+    """Fetch full message data for a specific set of ROWIDs."""
+    if not ids:
+        return []
+    placeholders = ",".join("?" * len(ids))
+    return _fetch_messages_query(conn, contact,
+        f"AND m.ROWID IN ({placeholders})", list(ids))
+
 def fetch_messages(conn: sqlite3.Connection, contact: str, since_id: int = 0) -> list[dict]:
+    """Return all messages (including attachments) for the given contact.
+    If since_id > 0, only returns messages with ROWID > since_id."""
+    return _fetch_messages_query(conn, contact,
+        f"AND m.ROWID > {since_id}" if since_id else "")
+
+def _fetch_messages_query(conn: sqlite3.Connection, contact: str,
+                          extra_where: str, extra_params: list = []) -> list[dict]:
     """Return all messages (including attachments) for the given contact.
     If since_id > 0, only returns messages with ROWID > since_id."""
     rows = conn.execute(f"""
@@ -134,9 +161,9 @@ def fetch_messages(conn: sqlite3.Connection, contact: str, since_id: int = 0) ->
         LEFT JOIN message_attachment_join maj ON m.ROWID = maj.message_id
         LEFT JOIN attachment a     ON maj.attachment_id = a.ROWID
         WHERE h2.id = ?
-        {"AND m.ROWID > " + str(since_id) if since_id else ""}
+        {extra_where}
         ORDER BY m.date ASC
-    """, (contact,)).fetchall()
+    """, (contact, *extra_params)).fetchall()
 
     # A single message can have multiple attachments → group by message_id
     messages: dict[int, dict] = {}
@@ -961,10 +988,9 @@ def main():
         except Exception:
             pass
 
-    last_id       = state.get("last_message_id", 0)
     preview_cache = state.get("preview_cache", {})
     existing_json = out_dir / "messages.json"
-    is_incremental = last_id > 0 and existing_json.exists()
+    is_incremental = existing_json.exists()
     patched = 0
     new_msgs: list[dict] = []
 
@@ -974,7 +1000,20 @@ def main():
         patched = patch_missing_text(conn, existing)
         if patched:
             print(f"  Patched text for {patched} previously-empty message(s).")
-        new_msgs = fetch_messages(conn, contact, since_id=last_id)
+        # Compare all DB IDs against the JSON to catch any gaps (messages that were
+        # fetched in a previous run but never written to messages.json).
+        json_ids = {m["message_id"] for m in existing}
+        db_ids   = fetch_all_message_ids(conn, contact)
+        gap_ids  = db_ids - json_ids
+        gap_msgs = fetch_messages_by_ids(conn, contact, gap_ids)
+        if gap_msgs:
+            print(f"  Filling {len(gap_msgs)} gap message(s) missing from previous exports.")
+        # Fetch messages newer than everything currently in the JSON
+        since_id = max(json_ids, default=0)
+        new_msgs = fetch_messages(conn, contact, since_id=since_id)
+        # new_msgs already excludes gap_ids (they're <= since_id or in the gap)
+        # Combine: existing + gaps + truly new
+        new_msgs = gap_msgs + [m for m in new_msgs if m["message_id"] not in gap_ids]
         if new_msgs:
             print(f"  Found {len(new_msgs)} new message(s) "
                   f"({len(existing) + len(new_msgs):,} total).")
@@ -1007,8 +1046,7 @@ def main():
         messages, preview_cache = fetch_link_previews(messages, out_dir, preview_cache)
 
     # ── Save state ──
-    state["last_message_id"] = max(m["message_id"] for m in messages)
-    state["preview_cache"]   = preview_cache
+    state["preview_cache"] = preview_cache
     state_path.write_text(json.dumps(state, indent=2, default=str))
 
     # ── Write exports ──

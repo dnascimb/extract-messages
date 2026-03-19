@@ -204,6 +204,33 @@ class TestFetchMessagesIncremental(unittest.TestCase):
         self.assertEqual(by_id[10]["sender"], "me")
         self.assertEqual(by_id[20]["sender"], "+15550001111")
 
+    def test_fetch_all_message_ids(self):
+        conn = self._make_full_db()
+        ids = em.fetch_all_message_ids(conn, "+15550001111")
+        self.assertEqual(ids, {10, 20, 30})
+
+    def test_fetch_messages_by_ids(self):
+        conn = self._make_full_db()
+        msgs = em.fetch_messages_by_ids(conn, "+15550001111", {10, 30})
+        self.assertEqual({m["message_id"] for m in msgs}, {10, 30})
+
+    def test_fetch_messages_by_ids_empty(self):
+        conn = self._make_full_db()
+        msgs = em.fetch_messages_by_ids(conn, "+15550001111", set())
+        self.assertEqual(msgs, [])
+
+    def test_gap_fill_detects_missing(self):
+        """gap_ids = db_ids - json_ids should catch messages missed in prior runs."""
+        conn = self._make_full_db()
+        db_ids  = em.fetch_all_message_ids(conn, "+15550001111")
+        # Simulate JSON that is missing message 20 (a historical gap)
+        json_ids = {10, 30}
+        gap_ids  = db_ids - json_ids
+        self.assertEqual(gap_ids, {20})
+        gap_msgs = em.fetch_messages_by_ids(conn, "+15550001111", gap_ids)
+        self.assertEqual(len(gap_msgs), 1)
+        self.assertEqual(gap_msgs[0]["message_id"], 20)
+
 
 # ── JSON always written (regression test for incremental state bug) ────────────
 
