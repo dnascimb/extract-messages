@@ -414,8 +414,7 @@ def fetch_link_previews(messages: list[dict], out_dir: Path,
                 og = fetch_youtube(url, preview_dir)
             else:
                 og = fetch_og(url)
-            if og:
-                preview_cache[url] = og
+            preview_cache[url] = og  # store None for failures so they aren't re-fetched
         print()
 
         # Download assets for non-YouTube URLs
@@ -450,7 +449,7 @@ def fetch_link_previews(messages: list[dict], out_dir: Path,
                     dest.write_text(og["lyrics"], encoding="utf-8")
                 og["local_lyrics"] = f"previews/{dest.name}"
 
-        new_dl = sum(1 for u in new_urls if preview_cache.get(u, {}).get("local_audio"))
+        new_dl = sum(1 for u in new_urls if (preview_cache.get(u) or {}).get("local_audio"))
         print(f"  ✔ {len(new_urls)} new URL(s) processed"
               + (f", {new_dl} audio file(s) downloaded." if new_dl else "."))
     else:
@@ -459,7 +458,8 @@ def fetch_link_previews(messages: list[dict], out_dir: Path,
     # Annotate messages
     for msg in messages:
         urls_in_msg = URL_RE.findall(msg.get("text") or "")
-        msg["link_previews"] = [preview_cache[u] for u in urls_in_msg if u in preview_cache]
+        msg["link_previews"] = [preview_cache[u] for u in urls_in_msg
+                                if preview_cache.get(u) is not None]
 
     return messages, preview_cache
 
