@@ -276,10 +276,22 @@ def fetch_og(url: str) -> dict | None:
             chunk_m = re.search(rf'{re.escape(idx)}:T([0-9a-f]+),', html)
             if chunk_m:
                 byte_len = int(chunk_m.group(1), 16)
-                raw = html[chunk_m.end() : chunk_m.end() + byte_len]
-                # RSC chunks split across __next_f.push calls insert JS boilerplate mid-text;
-                # remove every occurrence of the bridge pattern.
-                raw = re.sub(r'"\]\)</script><script>self\.__next_f\.push\(\[1,"', '', raw)
+                # RSC text chunks can be split across multiple __next_f.push calls.
+                # Scan forward, skipping bridge patterns, until we accumulate byte_len chars.
+                bridge = '"])</script><script>self.__next_f.push([1,"'
+                parts: list[str] = []
+                remaining = byte_len
+                pos = chunk_m.end()
+                while remaining > 0 and pos < len(html):
+                    next_b = html.find(bridge, pos)
+                    segment = html[pos: next_b if next_b != -1 else pos + remaining]
+                    take = min(len(segment), remaining)
+                    parts.append(segment[:take])
+                    remaining -= take
+                    if next_b == -1 or take < len(segment):
+                        break
+                    pos = next_b + len(bridge)
+                raw = "".join(parts)
                 # Unescape backslash-escaped content inside JS string literals
                 raw = raw.replace('\\"', '"').replace('\\n', '\n').replace('\\\\', '\\').strip()
                 result["lyrics"] = raw or None
@@ -997,11 +1009,14 @@ def main():
     state_path.write_text(json.dumps(state, indent=2, default=str))
 
     # ── Write exports ──
+    # Always write messages.json — it's the backing store for incremental runs.
+    # Without it, last_message_id and the cached message list fall out of sync.
+    json_path = out_dir / "messages.json"
+    write_json(messages, json_path)
+
     fmt = args.format
     if fmt in ("all", "json"):
-        p = out_dir / "messages.json"
-        write_json(messages, p)
-        print(f"  ✔ JSON   → {p}")
+        print(f"  ✔ JSON   → {json_path}")
 
     if fmt in ("all", "html"):
         p = out_dir / "messages.html"
