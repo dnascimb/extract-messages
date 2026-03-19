@@ -60,6 +60,16 @@ Open `messages.html` in a browser for a visual, bubble-style transcript.
 - **YouTube** — thumbnail and audio extracted via `yt-dlp` and embedded as an inline player
 - **Responsive** — adapts to desktop and mobile screen sizes
 
+## Development
+
+Run the test suite (no dependencies beyond stdlib):
+
+```bash
+python3 test_export.py
+```
+
+Tests cover: `attributedBody` decoding, timestamp conversion, incremental fetch logic, the empty-text backfill patch, the always-written `messages.json` invariant, and Suno lyrics extraction (same-push and split-push RSC cases).
+
 ## Notes
 
 - **Phone number format matters** — use full E.164 format (e.g. `+14155550100`). Run `--list-contacts` to see exactly how identifiers are stored.

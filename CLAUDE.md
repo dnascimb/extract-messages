@@ -5,6 +5,13 @@ A Python script that exports iMessage conversations from macOS's local SQLite da
 
 ## Key Files
 - `export_messages.py` — the main (and only) script
+- `test_export.py` — unit tests (stdlib only, no external deps)
+
+## Running Tests
+```bash
+python3 test_export.py
+```
+Run after any non-trivial change. Tests cover: `attributedBody` decoding, timestamp conversion, `patch_missing_text`, incremental fetch, `messages.json` always-written invariant, and Suno lyrics extraction (same-push and split-push RSC cases).
 
 ## How to Run
 ```bash
