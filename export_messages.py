@@ -1023,7 +1023,8 @@ def main():
             if new_atts:
                 print("  Copying new attachments…")
                 new_msgs = copy_attachments(new_msgs, out_dir / "attachments")
-            messages = existing + new_msgs
+            messages = sorted(existing + new_msgs,
+                              key=lambda m: m.get("timestamp_utc") or "")
         else:
             print(f"  No new messages — regenerating outputs ({len(existing):,} total).")
             messages = existing
