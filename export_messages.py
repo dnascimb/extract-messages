@@ -21,6 +21,7 @@ import re
 import subprocess
 import urllib.request
 import urllib.error
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -110,6 +111,7 @@ def fetch_messages(conn: sqlite3.Connection, contact: str) -> list[dict]:
     rows = conn.execute("""
         SELECT
             m.ROWID                         AS message_id,
+            m.guid                          AS guid,
             m.date                          AS apple_ts,
             m.is_from_me                    AS is_from_me,
             h.id                            AS sender,
@@ -149,8 +151,10 @@ def fetch_messages(conn: sqlite3.Connection, contact: str) -> list[dict]:
                 "text":          r["text"] or extract_attributed_body(r["attributed_body"]) or "",
                 "subject":       r["subject"] or "",
                 "service":       r["service"] or "",
+                "guid":          r["guid"] or "",
                 "is_reaction":   r["reaction_type"] not in (0, None),
                 "reaction_type": r["reaction_type"],
+                "reaction_target": (r["reaction_target"] or "").split("/")[-1],
                 "attachments":   [],
             }
         # Attach file info if present
@@ -367,12 +371,6 @@ def write_json(messages: list[dict], path: Path):
 def write_html(messages: list[dict], contact: str, path: Path):
     """Write a self-contained, iMessage-style HTML transcript."""
 
-    REACTION_LABELS = {
-        2000: "❤️ Loved", 2001: "👍 Liked", 2002: "👎 Disliked",
-        2003: "😂 Laughed", 2004: "‼️ Emphasized", 2005: "❓ Questioned",
-        3000: "♥ Loved (removed)", 3001: "👍 Like (removed)",
-    }
-
     avatar_letter = contact[1] if contact and len(contact) > 1 else contact[0] if contact else "?"
     total = len(messages)
 
@@ -548,6 +546,34 @@ def write_html(messages: list[dict], contact: str, path: Path):
 
   .missing {{ font-size: 0.78rem; opacity: 0.45; font-style: italic; line-height: 1.4; }}
 
+  /* ── Tapback reactions ── */
+  .bubble-outer {{
+    position: relative;
+    display: inline-block;
+  }}
+  .me   .bubble-outer {{ align-self: flex-end; }}
+  .them .bubble-outer {{ align-self: flex-start; }}
+  .has-reactions {{ margin-bottom: 14px; }}
+  .reaction-badges {{
+    position: absolute;
+    bottom: -13px;
+    display: flex;
+    gap: 3px;
+    flex-wrap: wrap;
+  }}
+  .me   .reaction-badges {{ left: 6px; }}
+  .them .reaction-badges {{ right: 6px; }}
+  .reaction-badge {{
+    background: var(--bg);
+    border: 1.5px solid var(--divider);
+    border-radius: 999px;
+    padding: 1px 6px;
+    font-size: 0.8rem;
+    white-space: nowrap;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.12);
+    line-height: 1.4;
+  }}
+
   /* ── Link preview cards ── */
   .link-preview {{
     display: block;
@@ -634,10 +660,35 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape')document.ge
 <div class="conversation">
 """
 
+    REACTION_EMOJI = {
+        2000: "❤️", 2001: "👍", 2002: "👎",
+        2003: "😂", 2004: "‼️", 2005: "❓",
+    }
+
+    # Build reactions map: message guid → list of emoji (deduped by sender+type)
+    reactions_map: dict[str, list[str]] = {}
+    seen = set()
+    for msg in messages:
+        rtype = msg.get("reaction_type")
+        if rtype in REACTION_EMOJI:
+            target = msg["reaction_target"]
+            key = (target, rtype, msg["sender"])
+            if target and key not in seen:
+                seen.add(key)
+                reactions_map.setdefault(target, []).append(REACTION_EMOJI[rtype])
+        elif rtype and 3000 <= rtype <= 3005:
+            # Removed reaction — cancel it
+            target = msg["reaction_target"]
+            original = rtype - 1000
+            key = (target, original, msg["sender"])
+            seen.add(key)  # prevent the original from being re-added
+
     lines = [header]
     last_day = None
 
     for msg in messages:
+        if msg["is_reaction"]:
+            continue  # rendered as badges on the target bubble, not as rows
         ts  = msg.get("timestamp_local") or ""
         day = ts[:10] if ts else "Unknown date"
 
@@ -649,23 +700,18 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape')document.ge
             lines.append(f'<div class="day-label">{day_fmt}</div>\n')
             last_day = day
 
-        side     = "me" if msg["is_from_me"] else "them"
-        svc_cls  = " sms" if (msg.get("service") or "").upper() == "SMS" else ""
-        react_cls = " reaction" if msg["is_reaction"] else ""
+        side    = "me" if msg["is_from_me"] else "them"
+        svc_cls = " sms" if (msg.get("service") or "").upper() == "SMS" else ""
         time_str = ts[11:16] if len(ts) >= 16 else ""
 
-        if msg["is_reaction"]:
-            content = REACTION_LABELS.get(msg["reaction_type"], f"Reaction {msg['reaction_type']}")
-            raw_text = content
+        raw_text = msg["text"] or ""
+        # If the entire message is just a URL that has a preview, suppress the raw URL
+        previewed_urls = {og["url"] for og in msg.get("link_previews", [])}
+        stripped = raw_text.strip()
+        if stripped in previewed_urls:
+            content = ""
         else:
-            raw_text = msg["text"] or ""
-            # If the entire message is just a URL that has a preview, suppress the raw URL
-            previewed_urls = {og["url"] for og in msg.get("link_previews", [])}
-            stripped = raw_text.strip()
-            if stripped in previewed_urls:
-                content = ""
-            else:
-                content = raw_text
+            content = raw_text
 
         content = content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -724,10 +770,25 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape')document.ge
                 + '</div></a>'
             )
 
+        msg_reactions = reactions_map.get(msg.get("guid", ""), [])
+        badges_html = ""
+        if msg_reactions:
+            counts = Counter(msg_reactions)
+            badges = "".join(
+                f'<span class="reaction-badge">{emoji}{" " + str(n) if n > 1 else ""}</span>'
+                for emoji, n in counts.items()
+            )
+            badges_html = f'<div class="reaction-badges">{badges}</div>'
+
+        has_reactions_cls = " has-reactions" if msg_reactions else ""
+
         lines.append(
-            f'<div class="bubble-row {side}{svc_cls}{react_cls}">\n'
+            f'<div class="bubble-row {side}{svc_cls}">\n'
             f'  <div class="bubble-wrap">\n'
-            f'    <div class="bubble">{content}{att_html}{preview_html}</div>\n'
+            f'    <div class="bubble-outer{has_reactions_cls}">\n'
+            f'      <div class="bubble">{content}{att_html}{preview_html}</div>\n'
+            f'      {badges_html}\n'
+            f'    </div>\n'
             f'    <div class="time">{time_str}</div>\n'
             f'  </div>\n'
             f'</div>\n'
