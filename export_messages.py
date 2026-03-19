@@ -1023,8 +1023,7 @@ def main():
             if new_atts:
                 print("  Copying new attachments…")
                 new_msgs = copy_attachments(new_msgs, out_dir / "attachments")
-            messages = sorted(existing + new_msgs,
-                              key=lambda m: m.get("timestamp_utc") or "")
+            messages = existing + new_msgs
         else:
             print(f"  No new messages — regenerating outputs ({len(existing):,} total).")
             messages = existing
@@ -1049,6 +1048,9 @@ def main():
     # ── Save state ──
     state["preview_cache"] = preview_cache
     state_path.write_text(json.dumps(state, indent=2, default=str))
+
+    # ── Sort — always, so JSON on disk is always in chronological order ──
+    messages.sort(key=lambda m: (m.get("timestamp_utc") or "", m["message_id"]))
 
     # ── Write exports ──
     # Always write messages.json — it's the backing store for incremental runs.
