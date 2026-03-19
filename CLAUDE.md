@@ -100,6 +100,13 @@ Stored as `associated_message_type` on the `message` row:
 - **Cache invariant**: every URL seen is written to `preview_cache` — `None` for failures, a dict for successes. This prevents re-fetching on every run. Do not change the `if og:` guard back; it was the root cause of the "8 URLs fetched every run" bug.
 
 ## Potential Enhancements
+
+### HTML / UI
+- **Image gallery lightbox** — clicking any image opens a full-screen lightbox that lets you scroll/arrow through *all* images in the conversation, not just the one clicked. The existing lightbox only shows one image at a time.
+- **Image burst grouping** — when 3 or more images are sent consecutively (same sender, close timestamps, no text between them), display them as a grid tile group like the real Messages app does, rather than stacking them vertically as individual bubbles.
+- **Tapback summary bar** — show all reaction types on a message as a compact row of emoji+count badges, matching the Messages popover style.
+
+### Export / Data
 - Group chat support (query by `chat.ROWID` instead of `handle.id`)
 - Date range filtering (`--after`, `--before` flags)
 - iCloud attachment auto-download via `brctl` CLI
