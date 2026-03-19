@@ -947,6 +947,7 @@ def main():
     contact = args.contact
     out_dir = Path(args.output.replace("~", str(Path.home()))) / contact.replace("+", "").replace("@", "_at_")
     out_dir.mkdir(parents=True, exist_ok=True)
+    run_start = datetime.now(tz=timezone.utc)
 
     print(f"\nExporting messages with: {contact}")
     print(f"Output directory: {out_dir}\n")
@@ -964,6 +965,8 @@ def main():
     preview_cache = state.get("preview_cache", {})
     existing_json = out_dir / "messages.json"
     is_incremental = last_id > 0 and existing_json.exists()
+    patched = 0
+    new_msgs: list[dict] = []
 
     # ── Fetch messages ──
     if is_incremental:
@@ -1029,6 +1032,35 @@ def main():
         print(f"  ✔ TXT    → {p}")
 
     print(f"\nDone! Open {out_dir / 'messages.html'} in a browser for a visual transcript.\n")
+
+    # ── Audit log ──
+    run_end = datetime.now(tz=timezone.utc)
+    log_path = Path(__file__).parent / "run_log.json"
+    log: list[dict] = []
+    if log_path.exists():
+        try:
+            log = json.loads(log_path.read_text())
+        except Exception:
+            pass
+
+    new_msgs_count = len(new_msgs) if is_incremental else len(messages)
+    previews_fetched = sum(
+        1 for m in messages
+        for lp in (m.get("link_previews") or [])
+        if lp and lp.get("local_audio")
+    )
+    log.append({
+        "run_at":         run_start.isoformat(),
+        "duration_s":     round((run_end - run_start).total_seconds(), 1),
+        "contact":        contact,
+        "format":         args.format,
+        "total_messages": len(messages),
+        "new_messages":   new_msgs_count,
+        "patched_messages": patched if is_incremental else 0,
+        "previews_fetched": previews_fetched,
+        "output_dir":     str(out_dir),
+    })
+    log_path.write_text(json.dumps(log, indent=2))
 
 if __name__ == "__main__":
     main()

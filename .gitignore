@@ -13,6 +13,12 @@ build/
 .venv/
 venv/
 
+# Personal shortcuts (contain phone numbers)
+*.command
+
+# Local audit log
+run_log.json
+
 # Export output
 messages_export/
 *.html
