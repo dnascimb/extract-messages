@@ -106,9 +106,10 @@ def list_contacts(conn: sqlite3.Connection):
         print(f"{r['contact']:<35} {name:<30} {r['message_count']:>8}")
     print(f"\n{len(rows)} conversation(s) found.\n")
 
-def fetch_messages(conn: sqlite3.Connection, contact: str) -> list[dict]:
-    """Return all messages (including attachments) for the given contact."""
-    rows = conn.execute("""
+def fetch_messages(conn: sqlite3.Connection, contact: str, since_id: int = 0) -> list[dict]:
+    """Return all messages (including attachments) for the given contact.
+    If since_id > 0, only returns messages with ROWID > since_id."""
+    rows = conn.execute(f"""
         SELECT
             m.ROWID                         AS message_id,
             m.guid                          AS guid,
@@ -133,6 +134,7 @@ def fetch_messages(conn: sqlite3.Connection, contact: str) -> list[dict]:
         LEFT JOIN message_attachment_join maj ON m.ROWID = maj.message_id
         LEFT JOIN attachment a     ON maj.attachment_id = a.ROWID
         WHERE h2.id = ?
+        {"AND m.ROWID > " + str(since_id) if since_id else ""}
         ORDER BY m.date ASC
     """, (contact,)).fetchall()
 
@@ -185,14 +187,17 @@ def copy_attachments(messages: list[dict], dest_dir: Path) -> list[dict]:
             src = resolve_attachment_path(att["original_path"])
             if src:
                 dst = dest_dir / src.name
-                # Avoid name collisions
-                counter = 1
-                stem, suffix = dst.stem, dst.suffix
-                while dst.exists():
-                    dst = dest_dir / f"{stem}_{counter}{suffix}"
-                    counter += 1
-                shutil.copy2(src, dst)
-                att["exported_filename"] = dst.name
+                if dst.exists():
+                    att["exported_filename"] = dst.name  # already copied
+                else:
+                    # Avoid name collisions with other new files
+                    counter = 1
+                    stem, suffix = dst.stem, dst.suffix
+                    while dst.exists():
+                        dst = dest_dir / f"{stem}_{counter}{suffix}"
+                        counter += 1
+                    shutil.copy2(src, dst)
+                    att["exported_filename"] = dst.name
             else:
                 att["exported_filename"] = None
                 missing += 1
@@ -298,8 +303,13 @@ def fetch_youtube(url: str, preview_dir: Path) -> dict | None:
     return result if result["title"] else None
 
 
-def fetch_link_previews(messages: list[dict], out_dir: Path) -> list[dict]:
-    """Fetch OG previews for URLs in messages and download assets locally."""
+def fetch_link_previews(messages: list[dict], out_dir: Path,
+                        preview_cache: dict | None = None) -> tuple[list[dict], dict]:
+    """Fetch OG previews for URLs in messages and download assets locally.
+    preview_cache maps url -> og dict for already-processed URLs (no re-fetch).
+    Returns (annotated_messages, updated_cache)."""
+    preview_cache = dict(preview_cache or {})
+
     # Collect unique URLs across all messages
     unique_urls: dict[str, None] = {}
     for msg in messages:
@@ -307,60 +317,62 @@ def fetch_link_previews(messages: list[dict], out_dir: Path) -> list[dict]:
             unique_urls[url] = None
 
     if not unique_urls:
-        return messages
+        return messages, preview_cache
 
     preview_dir = out_dir / "previews"
-    print(f"  Fetching link previews for {len(unique_urls)} URL(s)…")
-    previews: dict[str, dict] = {}
-    for i, url in enumerate(unique_urls, 1):
-        print(f"    [{i}/{len(unique_urls)}] {url[:80]}", end="\r", flush=True)
-        if YOUTUBE_RE.match(url):
-            og = fetch_youtube(url, preview_dir)
-        else:
-            og = fetch_og(url)
-        if og:
-            previews[url] = og
-    print()  # newline after progress
+    new_urls = [u for u in unique_urls if u not in preview_cache]
 
-    if not previews:
-        return messages
+    if new_urls:
+        print(f"  Fetching link previews for {len(new_urls)} new URL(s)…")
+        for i, url in enumerate(new_urls, 1):
+            print(f"    [{i}/{len(new_urls)}] {url[:80]}", end="\r", flush=True)
+            if YOUTUBE_RE.match(url):
+                og = fetch_youtube(url, preview_dir)
+            else:
+                og = fetch_og(url)
+            if og:
+                preview_cache[url] = og
+        print()
 
-    # Download assets for non-YouTube URLs (YouTube assets handled in fetch_youtube)
-    preview_dir.mkdir(parents=True, exist_ok=True)
+        # Download assets for non-YouTube URLs
+        preview_dir.mkdir(parents=True, exist_ok=True)
 
-    def download(src_url: str, dest: Path) -> bool:
-        if dest.exists():
-            return True
-        try:
-            urllib.request.urlretrieve(src_url, dest)
-            return True
-        except Exception:
-            return False
+        def download(src_url: str, dest: Path) -> bool:
+            if dest.exists():
+                return True
+            try:
+                urllib.request.urlretrieve(src_url, dest)
+                return True
+            except Exception:
+                return False
 
-    for url, og in previews.items():
-        if YOUTUBE_RE.match(url):
-            continue  # already handled
-        key = abs(hash(url)) & 0xFFFFFF
-        if og.get("image_url"):
-            ext = og["image_url"].rsplit(".", 1)[-1].split("?")[0][:4] or "jpg"
-            dest = preview_dir / f"img_{key}.{ext}"
-            if download(og["image_url"], dest):
-                og["local_image"] = f"previews/{dest.name}"
-        if og.get("audio_url"):
-            dest = preview_dir / f"audio_{key}.mp3"
-            if download(og["audio_url"], dest):
-                og["local_audio"] = f"previews/{dest.name}"
+        for url in new_urls:
+            og = preview_cache.get(url)
+            if not og or YOUTUBE_RE.match(url):
+                continue
+            key = abs(hash(url)) & 0xFFFFFF
+            if og.get("image_url"):
+                ext = og["image_url"].rsplit(".", 1)[-1].split("?")[0][:4] or "jpg"
+                dest = preview_dir / f"img_{key}.{ext}"
+                if download(og["image_url"], dest):
+                    og["local_image"] = f"previews/{dest.name}"
+            if og.get("audio_url"):
+                dest = preview_dir / f"audio_{key}.mp3"
+                if download(og["audio_url"], dest):
+                    og["local_audio"] = f"previews/{dest.name}"
 
-    downloaded = sum(1 for og in previews.values() if og.get("local_audio"))
-    print(f"  ✔ {len(previews)} link preview(s) fetched"
-          + (f", {downloaded} audio file(s) downloaded." if downloaded else "."))
+        new_dl = sum(1 for u in new_urls if preview_cache.get(u, {}).get("local_audio"))
+        print(f"  ✔ {len(new_urls)} new URL(s) processed"
+              + (f", {new_dl} audio file(s) downloaded." if new_dl else "."))
+    else:
+        print(f"  ✔ Link previews up to date ({len(preview_cache)} cached).")
 
     # Annotate messages
     for msg in messages:
         urls_in_msg = URL_RE.findall(msg.get("text") or "")
-        msg["link_previews"] = [previews[u] for u in urls_in_msg if u in previews]
+        msg["link_previews"] = [preview_cache[u] for u in urls_in_msg if u in preview_cache]
 
-    return messages
+    return messages, preview_cache
 
 
 # ── Export formats ──────────────────────────────────────────────────────────────
@@ -847,28 +859,60 @@ def main():
     print(f"\nExporting messages with: {contact}")
     print(f"Output directory: {out_dir}\n")
 
-    messages = fetch_messages(conn, contact)
-    if not messages:
-        sys.exit(f"[error] No messages found for '{contact}'.\n"
-                 "Run with --list-contacts to see available identifiers.")
+    # ── Load state (for incremental runs) ──
+    state_path = out_dir / "export_state.json"
+    state: dict = {}
+    if state_path.exists():
+        try:
+            state = json.loads(state_path.read_text())
+        except Exception:
+            pass
 
-    if args.no_reactions:
-        messages = [m for m in messages if not m["is_reaction"]]
+    last_id       = state.get("last_message_id", 0)
+    preview_cache = state.get("preview_cache", {})
+    existing_json = out_dir / "messages.json"
+    is_incremental = last_id > 0 and existing_json.exists()
 
-    total = len(messages)
-    attachments_total = sum(len(m["attachments"]) for m in messages)
-    print(f"  Found {total} message(s), {attachments_total} attachment(s).")
+    # ── Fetch messages ──
+    if is_incremental:
+        new_msgs = fetch_messages(conn, contact, since_id=last_id)
+        if not new_msgs:
+            print("  Already up to date — no new messages.\n")
+            return
+        existing = json.loads(existing_json.read_text())
+        print(f"  Found {len(new_msgs)} new message(s) "
+              f"({len(existing) + len(new_msgs):,} total).")
+        if args.no_reactions:
+            new_msgs = [m for m in new_msgs if not m["is_reaction"]]
+        new_atts = sum(len(m["attachments"]) for m in new_msgs)
+        if new_atts:
+            print("  Copying new attachments…")
+            new_msgs = copy_attachments(new_msgs, out_dir / "attachments")
+        if not args.no_link_previews and args.format in ("all", "html"):
+            new_msgs, preview_cache = fetch_link_previews(new_msgs, out_dir, preview_cache)
+        messages = existing + new_msgs
+    else:
+        messages = fetch_messages(conn, contact)
+        if not messages:
+            sys.exit(f"[error] No messages found for '{contact}'.\n"
+                     "Run with --list-contacts to see available identifiers.")
+        if args.no_reactions:
+            messages = [m for m in messages if not m["is_reaction"]]
+        total = len(messages)
+        atts  = sum(len(m["attachments"]) for m in messages)
+        print(f"  Found {total:,} message(s), {atts} attachment(s).")
+        if atts:
+            print("  Copying attachments…")
+            messages = copy_attachments(messages, out_dir / "attachments")
+        if not args.no_link_previews and args.format in ("all", "html"):
+            messages, preview_cache = fetch_link_previews(messages, out_dir, preview_cache)
 
-    # Copy attachments
-    if attachments_total > 0:
-        print("  Copying attachments…")
-        messages = copy_attachments(messages, out_dir / "attachments")
+    # ── Save state ──
+    state["last_message_id"] = max(m["message_id"] for m in messages)
+    state["preview_cache"]   = preview_cache
+    state_path.write_text(json.dumps(state, indent=2, default=str))
 
-    # Fetch link previews
-    if not args.no_link_previews and args.format in ("all", "html"):
-        messages = fetch_link_previews(messages, out_dir)
-
-    # Write exports
+    # ── Write exports ──
     fmt = args.format
     if fmt in ("all", "json"):
         p = out_dir / "messages.json"
