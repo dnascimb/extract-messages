@@ -97,6 +97,7 @@ Stored as `associated_message_type` on the `message` row:
 - `fetch_link_previews(messages, out_dir)` — orchestrates fetching for all unique URLs; caches assets to `previews/`; annotates each message with a `link_previews` list
 - Preview assets are keyed by `abs(hash(url)) & 0xFFFFFF` for non-YouTube, or `yt_{video_id}` for YouTube
 - YouTube playlists/channels get a preview card but no audio download
+- **Cache invariant**: every URL seen is written to `preview_cache` — `None` for failures, a dict for successes. This prevents re-fetching on every run. Do not change the `if og:` guard back; it was the root cause of the "8 URLs fetched every run" bug.
 
 ## Potential Enhancements
 - Group chat support (query by `chat.ROWID` instead of `handle.id`)

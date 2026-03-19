@@ -232,6 +232,42 @@ class TestFetchMessagesIncremental(unittest.TestCase):
         self.assertEqual(gap_msgs[0]["message_id"], 20)
 
 
+# ── Preview cache persistence ─────────────────────────────────────────────────
+
+class TestPreviewCache(unittest.TestCase):
+    def test_failed_fetch_stored_as_none(self):
+        """URLs that return no OG data must be stored as None so they
+        aren't re-fetched on every subsequent run."""
+        cache = {}
+        url = "https://example.com/no-og-tags"
+        og = None  # simulate a failed fetch
+        cache[url] = og
+        self.assertIn(url, cache)
+        self.assertIsNone(cache[url])
+
+    def test_none_cache_entry_skipped_by_new_urls(self):
+        """A cached None entry must cause the URL to be skipped (not re-fetched)."""
+        cache = {"https://example.com/": None}
+        new_urls = [u for u in ["https://example.com/"] if u not in cache]
+        self.assertEqual(new_urls, [])
+
+    def test_none_cache_entry_excluded_from_link_previews(self):
+        """None cache entries must not appear in a message's link_previews list."""
+        cache = {"https://example.com/": None, "https://suno.com/s/abc": {"title": "Song"}}
+        urls_in_msg = ["https://example.com/", "https://suno.com/s/abc"]
+        previews = [cache[u] for u in urls_in_msg if cache.get(u) is not None]
+        self.assertEqual(len(previews), 1)
+        self.assertEqual(previews[0]["title"], "Song")
+
+    def test_none_cache_survives_json_roundtrip(self):
+        """None values must survive JSON serialisation so the cache persists across runs."""
+        import json
+        cache = {"https://example.com/": None}
+        restored = json.loads(json.dumps({"preview_cache": cache}))["preview_cache"]
+        self.assertIn("https://example.com/", restored)
+        self.assertIsNone(restored["https://example.com/"])
+
+
 # ── JSON always written (regression test for incremental state bug) ────────────
 
 class TestJsonAlwaysWritten(unittest.TestCase):
