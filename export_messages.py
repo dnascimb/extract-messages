@@ -17,6 +17,10 @@ import sys
 import json
 import shutil
 import argparse
+import re
+import subprocess
+import urllib.request
+import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,6 +37,34 @@ def apple_ts_to_datetime(ts: int) -> datetime:
         return None
     unix_ts = ts / 1_000_000_000 + APPLE_EPOCH_OFFSET
     return datetime.fromtimestamp(unix_ts, tz=timezone.utc)
+
+# ── attributedBody decoder ──────────────────────────────────────────────────────
+def extract_attributed_body(blob: bytes) -> str | None:
+    """Extract plain text from an NSArchiver streamtyped NSAttributedString blob."""
+    if not blob:
+        return None
+    try:
+        # Text follows the marker \x84\x01+ with a variable-length byte count prefix
+        marker = blob.find(b'\x84\x01+')
+        if marker == -1:
+            return None
+        pos = marker + 3
+        b0 = blob[pos]
+        if b0 < 0x80:
+            length, pos = b0, pos + 1
+        elif b0 == 0x81:
+            length = int.from_bytes(blob[pos + 1:pos + 3], 'little')
+            pos += 3
+        elif b0 == 0x82:
+            length = int.from_bytes(blob[pos + 1:pos + 5], 'little')
+            pos += 5
+        else:
+            return None
+        text = blob[pos:pos + length].decode('utf-8', errors='replace')
+        return text.strip() or None
+    except Exception:
+        return None
+
 
 # ── Database helpers ────────────────────────────────────────────────────────────
 def open_db() -> sqlite3.Connection:
@@ -82,6 +114,7 @@ def fetch_messages(conn: sqlite3.Connection, contact: str) -> list[dict]:
             m.is_from_me                    AS is_from_me,
             h.id                            AS sender,
             m.text                          AS text,
+            m.attributedBody                AS attributed_body,
             m.associated_message_type       AS reaction_type,
             m.associated_message_guid       AS reaction_target,
             m.subject                       AS subject,
@@ -113,7 +146,7 @@ def fetch_messages(conn: sqlite3.Connection, contact: str) -> list[dict]:
                 "timestamp_local": dt.astimezone().strftime("%Y-%m-%d %H:%M:%S") if dt else None,
                 "is_from_me":    bool(r["is_from_me"]),
                 "sender":        "me" if r["is_from_me"] else (r["sender"] or contact),
-                "text":          r["text"] or "",
+                "text":          r["text"] or extract_attributed_body(r["attributed_body"]) or "",
                 "subject":       r["subject"] or "",
                 "service":       r["service"] or "",
                 "is_reaction":   r["reaction_type"] not in (0, None),
@@ -165,6 +198,167 @@ def copy_attachments(messages: list[dict], dest_dir: Path) -> list[dict]:
               "(may be iCloud-only — scroll to them in Messages to download).")
     return messages
 
+# ── Link previews ───────────────────────────────────────────────────────────────
+URL_RE = re.compile(r'https?://[^\s]+')
+YOUTUBE_RE = re.compile(r'https?://(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com)')
+
+def fetch_og(url: str) -> dict | None:
+    """Fetch Open Graph metadata (and Suno audio URL) from a URL."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        html = urllib.request.urlopen(req, timeout=10).read().decode("utf-8", errors="ignore")
+    except Exception:
+        return None
+
+    def og(prop):
+        m = re.search(rf'<meta[^>]+property=["\']og:{prop}["\'][^>]+content=["\']([^"\']+)["\']', html)
+        if not m:
+            m = re.search(rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:{prop}["\']', html)
+        return m.group(1) if m else None
+
+    result = {
+        "url":         url,
+        "title":       og("title"),
+        "description": og("description"),
+        "image_url":   og("image"),
+        "audio_url":   None,
+    }
+
+    # Suno: extract audio URL from embedded MP3 reference
+    if "suno.com" in url:
+        mp3 = re.search(r'https://cdn\d*\.suno\.ai/([a-f0-9\-]{36})\.mp3', html)
+        if mp3:
+            result["audio_url"] = f"https://cdn1.suno.ai/{mp3.group(1)}.mp3"
+
+    return result if (result["title"] or result["image_url"]) else None
+
+
+def fetch_youtube(url: str, preview_dir: Path) -> dict | None:
+    """Use yt-dlp to fetch metadata and download audio for a YouTube URL."""
+    try:
+        meta_raw = subprocess.run(
+            ["yt-dlp", "--dump-json", "--no-playlist", url],
+            capture_output=True, text=True, timeout=30
+        )
+        if meta_raw.returncode != 0:
+            return None
+        meta = json.loads(meta_raw.stdout)
+    except Exception:
+        return None
+
+    title     = meta.get("title")
+    desc      = meta.get("description", "")[:120] or None
+    thumb_url = meta.get("thumbnail")
+    video_id  = meta.get("id", re.sub(r'[^a-zA-Z0-9_-]', '_', url)[-24:])
+    is_single = meta.get("_type", "video") != "playlist"
+
+    result = {
+        "url":         url,
+        "title":       title,
+        "description": desc,
+        "image_url":   thumb_url,
+        "audio_url":   None,
+        "local_image": None,
+        "local_audio": None,
+    }
+
+    preview_dir.mkdir(parents=True, exist_ok=True)
+
+    # Download thumbnail
+    if thumb_url:
+        img_dest = preview_dir / f"yt_{video_id}.jpg"
+        if not img_dest.exists():
+            try:
+                urllib.request.urlretrieve(thumb_url, img_dest)
+            except Exception:
+                img_dest = None
+        if img_dest and img_dest.exists():
+            result["local_image"] = f"previews/{img_dest.name}"
+
+    # Download audio for individual videos/songs (skip playlists/channels)
+    if is_single:
+        audio_dest = preview_dir / f"yt_{video_id}.mp3"
+        if not audio_dest.exists():
+            try:
+                subprocess.run(
+                    ["yt-dlp", "-x", "--audio-format", "mp3", "--audio-quality", "5",
+                     "--no-playlist", "-o", str(audio_dest.with_suffix("")),
+                     url],
+                    capture_output=True, timeout=120
+                )
+            except Exception:
+                pass
+        if audio_dest.exists():
+            result["local_audio"] = f"previews/{audio_dest.name}"
+
+    return result if result["title"] else None
+
+
+def fetch_link_previews(messages: list[dict], out_dir: Path) -> list[dict]:
+    """Fetch OG previews for URLs in messages and download assets locally."""
+    # Collect unique URLs across all messages
+    unique_urls: dict[str, None] = {}
+    for msg in messages:
+        for url in URL_RE.findall(msg.get("text") or ""):
+            unique_urls[url] = None
+
+    if not unique_urls:
+        return messages
+
+    preview_dir = out_dir / "previews"
+    print(f"  Fetching link previews for {len(unique_urls)} URL(s)…")
+    previews: dict[str, dict] = {}
+    for i, url in enumerate(unique_urls, 1):
+        print(f"    [{i}/{len(unique_urls)}] {url[:80]}", end="\r", flush=True)
+        if YOUTUBE_RE.match(url):
+            og = fetch_youtube(url, preview_dir)
+        else:
+            og = fetch_og(url)
+        if og:
+            previews[url] = og
+    print()  # newline after progress
+
+    if not previews:
+        return messages
+
+    # Download assets for non-YouTube URLs (YouTube assets handled in fetch_youtube)
+    preview_dir.mkdir(parents=True, exist_ok=True)
+
+    def download(src_url: str, dest: Path) -> bool:
+        if dest.exists():
+            return True
+        try:
+            urllib.request.urlretrieve(src_url, dest)
+            return True
+        except Exception:
+            return False
+
+    for url, og in previews.items():
+        if YOUTUBE_RE.match(url):
+            continue  # already handled
+        key = abs(hash(url)) & 0xFFFFFF
+        if og.get("image_url"):
+            ext = og["image_url"].rsplit(".", 1)[-1].split("?")[0][:4] or "jpg"
+            dest = preview_dir / f"img_{key}.{ext}"
+            if download(og["image_url"], dest):
+                og["local_image"] = f"previews/{dest.name}"
+        if og.get("audio_url"):
+            dest = preview_dir / f"audio_{key}.mp3"
+            if download(og["audio_url"], dest):
+                og["local_audio"] = f"previews/{dest.name}"
+
+    downloaded = sum(1 for og in previews.values() if og.get("local_audio"))
+    print(f"  ✔ {len(previews)} link preview(s) fetched"
+          + (f", {downloaded} audio file(s) downloaded." if downloaded else "."))
+
+    # Annotate messages
+    for msg in messages:
+        urls_in_msg = URL_RE.findall(msg.get("text") or "")
+        msg["link_previews"] = [previews[u] for u in urls_in_msg if u in previews]
+
+    return messages
+
+
 # ── Export formats ──────────────────────────────────────────────────────────────
 def write_json(messages: list[dict], path: Path):
     with open(path, "w", encoding="utf-8") as f:
@@ -172,68 +366,6 @@ def write_json(messages: list[dict], path: Path):
 
 def write_html(messages: list[dict], contact: str, path: Path):
     """Write a self-contained, iMessage-style HTML transcript."""
-    lines = [f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<title>Messages with {contact}</title>
-<style>
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    background: #f5f5f7;
-    color: #1c1c1e;
-    padding: 24px;
-  }}
-  h1 {{ font-size: 1.1rem; color: #6e6e73; margin-bottom: 20px; text-align: center; }}
-  .day-label {{
-    text-align: center;
-    font-size: 0.72rem;
-    color: #8e8e93;
-    margin: 18px 0 8px;
-    letter-spacing: 0.03em;
-    text-transform: uppercase;
-  }}
-  .bubble-row {{
-    display: flex;
-    margin: 3px 0;
-  }}
-  .bubble-row.me    {{ justify-content: flex-end; }}
-  .bubble-row.them  {{ justify-content: flex-start; }}
-  .bubble {{
-    max-width: 68%;
-    padding: 8px 13px;
-    border-radius: 18px;
-    font-size: 0.93rem;
-    line-height: 1.45;
-    word-break: break-word;
-    white-space: pre-wrap;
-  }}
-  .me   .bubble {{ background: #0b93f6; color: #fff; border-bottom-right-radius: 4px; }}
-  .them .bubble {{ background: #e5e5ea; color: #1c1c1e; border-bottom-left-radius: 4px; }}
-  .reaction .bubble {{
-    font-size: 0.78rem;
-    opacity: 0.65;
-    padding: 4px 10px;
-    border-radius: 12px;
-  }}
-  .time {{
-    font-size: 0.65rem;
-    color: #8e8e93;
-    margin-top: 2px;
-    text-align: right;
-    padding: 0 4px;
-  }}
-  .them .time {{ text-align: left; }}
-  .attachment {{ margin-top: 6px; }}
-  .attachment a {{ color: inherit; text-decoration: underline; opacity: 0.85; }}
-  img.inline {{ max-width: 260px; border-radius: 12px; margin-top: 4px; display: block; }}
-  video.inline {{ max-width: 280px; border-radius: 12px; margin-top: 4px; }}
-</style>
-</head>
-<body>
-<h1>Messages with {contact}</h1>
-"""]
 
     REACTION_LABELS = {
         2000: "❤️ Loved", 2001: "👍 Liked", 2002: "👎 Disliked",
@@ -241,61 +373,367 @@ def write_html(messages: list[dict], contact: str, path: Path):
         3000: "♥ Loved (removed)", 3001: "👍 Like (removed)",
     }
 
+    avatar_letter = contact[1] if contact and len(contact) > 1 else contact[0] if contact else "?"
+    total = len(messages)
+
+    header = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Messages with {contact}</title>
+<style>
+  *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+
+  :root {{
+    --bg: #f5f5f7;
+    --text: #1c1c1e;
+    --subtext: #8e8e93;
+    --them-bubble: #e5e5ea;
+    --them-text: #1c1c1e;
+    --me-blue: #007aff;
+    --me-green: #34c759;
+    --divider: #c6c6c8;
+    --card-bg: rgba(0,0,0,0.06);
+    --card-hover: rgba(0,0,0,0.1);
+  }}
+  @media (prefers-color-scheme: dark) {{
+    :root {{
+      --bg: #000;
+      --text: #fff;
+      --subtext: #8e8e93;
+      --them-bubble: #2c2c2e;
+      --them-text: #fff;
+      --me-blue: #0a84ff;
+      --me-green: #30d158;
+      --divider: #3a3a3c;
+      --card-bg: rgba(255,255,255,0.1);
+      --card-hover: rgba(255,255,255,0.15);
+    }}
+  }}
+
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font-size: 21px;
+    background: var(--bg);
+    color: var(--text);
+    padding: 0 0 48px;
+  }}
+
+
+  /* ── Header ── */
+  .msg-header {{
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    background: var(--bg);
+    border-bottom: 1px solid var(--divider);
+    text-align: center;
+    padding: 14px 16px 12px;
+  }}
+  .avatar {{
+    width: 52px; height: 52px;
+    border-radius: 50%;
+    background: var(--me-blue);
+    color: #fff;
+    font-size: 1.3rem;
+    font-weight: 600;
+    display: flex; align-items: center; justify-content: center;
+    margin: 0 auto 6px;
+  }}
+  .msg-header h1 {{ font-size: 1rem; font-weight: 600; }}
+  .msg-header .sub {{ font-size: 0.75rem; color: var(--subtext); margin-top: 2px; }}
+
+  /* ── Day label ── */
+  .day-label {{
+    text-align: center;
+    font-size: 0.68rem;
+    color: var(--subtext);
+    font-weight: 500;
+    margin: 18px 0 6px;
+    letter-spacing: 0.04em;
+  }}
+
+  /* ── Bubble rows ── */
+  .bubble-row {{
+    display: flex;
+    padding: 2px 16px;
+    align-items: flex-end;
+    gap: 6px;
+  }}
+  .bubble-row.me   {{ justify-content: flex-end; }}
+  .bubble-row.them {{ justify-content: flex-start; }}
+
+  .bubble-wrap {{
+    max-width: 55%;
+    display: flex;
+    flex-direction: column;
+  }}
+  .me   .bubble-wrap {{ align-items: flex-end; }}
+  .them .bubble-wrap {{ align-items: flex-start; }}
+
+  .bubble {{
+    padding: 10px 15px;
+    border-radius: 18px;
+    font-size: 1rem;
+    line-height: 1.5;
+    word-break: break-word;
+    white-space: pre-wrap;
+  }}
+  .me            .bubble {{ background: var(--me-blue);  color: #fff;            border-bottom-right-radius: 4px; }}
+  .me.sms        .bubble {{ background: var(--me-green); color: #fff;            border-bottom-right-radius: 4px; }}
+  .them          .bubble {{ background: var(--them-bubble); color: var(--them-text); border-bottom-left-radius: 4px; }}
+  .reaction      .bubble {{ font-size: 0.75rem; opacity: 0.6; padding: 3px 10px; border-radius: 12px; }}
+
+  .time {{
+    font-size: 0.62rem;
+    color: var(--subtext);
+    margin-top: 3px;
+    padding: 0 4px;
+  }}
+
+  /* ── Attachments ── */
+  .attachment {{ margin-top: 6px; line-height: 0; }}
+  .attachment:first-child {{ margin-top: 0; }}
+
+  img.inline {{
+    max-width: 100%;
+    width: auto;
+    max-height: 400px;
+    height: auto;
+    border-radius: 14px;
+    display: block;
+    cursor: zoom-in;
+    object-fit: cover;
+  }}
+  video.inline {{
+    max-width: 100%;
+    width: auto;
+    max-height: 400px;
+    border-radius: 14px;
+    display: block;
+  }}
+  audio.inline {{
+    max-width: 100%;
+    width: 280px;
+    display: block;
+    margin: 2px 0;
+  }}
+
+  .file-card {{
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    background: var(--card-bg);
+    border-radius: 12px;
+    padding: 9px 12px;
+    text-decoration: none;
+    color: inherit;
+    max-width: 240px;
+    transition: background 0.15s;
+  }}
+  .file-card:hover {{ background: var(--card-hover); }}
+  .file-card .icon {{ font-size: 1.5rem; flex-shrink: 0; line-height: 1; }}
+  .file-card .info {{ min-width: 0; }}
+  .file-card .fname {{
+    font-size: 0.83rem;
+    font-weight: 500;
+    line-height: 1.3;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 170px;
+  }}
+  .file-card .ftype {{ font-size: 0.7rem; opacity: 0.55; margin-top: 1px; line-height: 1; }}
+
+  .missing {{ font-size: 0.78rem; opacity: 0.45; font-style: italic; line-height: 1.4; }}
+
+  /* ── Link preview cards ── */
+  .link-preview {{
+    display: block;
+    border-radius: 14px;
+    overflow: hidden;
+    background: var(--card-bg);
+    text-decoration: none;
+    color: inherit;
+    margin-top: 6px;
+    max-width: 300px;
+    transition: opacity 0.15s;
+  }}
+  .link-preview:hover {{ opacity: 0.85; }}
+  .link-preview .preview-img {{
+    width: 100%;
+    height: 160px;
+    object-fit: cover;
+    display: block;
+  }}
+  .link-preview .preview-body {{
+    padding: 9px 12px 11px;
+  }}
+  .link-preview .preview-domain {{
+    font-size: 0.68rem;
+    opacity: 0.5;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 3px;
+  }}
+  .link-preview .preview-title {{
+    font-size: 0.9rem;
+    font-weight: 600;
+    line-height: 1.3;
+  }}
+  .link-preview .preview-desc {{
+    font-size: 0.78rem;
+    opacity: 0.65;
+    margin-top: 3px;
+    line-height: 1.35;
+  }}
+  .link-preview audio {{
+    width: 100%;
+    margin-top: 8px;
+    display: block;
+  }}
+
+  /* ── Lightbox ── */
+  #lb {{
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.9);
+    z-index: 100;
+    align-items: center;
+    justify-content: center;
+    cursor: zoom-out;
+  }}
+  #lb.open {{ display: flex; }}
+  #lb img {{ max-width: 95vw; max-height: 95vh; border-radius: 6px; object-fit: contain; }}
+
+  /* ── Responsive ── */
+  @media (max-width: 600px) {{
+    .bubble-wrap {{ max-width: 82%; }}
+    .file-card   {{ max-width: 200px; }}
+    .file-card .fname {{ max-width: 130px; }}
+  }}
+</style>
+</head>
+<body>
+
+<div class="msg-header">
+  <div class="avatar">{avatar_letter}</div>
+  <h1>{contact}</h1>
+  <div class="sub">{total:,} messages</div>
+</div>
+
+<div id="lb" onclick="this.classList.remove('open')">
+  <img id="lb-img" src="" alt="">
+</div>
+<script>
+function lb(src){{document.getElementById('lb-img').src=src;document.getElementById('lb').classList.add('open');}}
+document.addEventListener('keydown',function(e){{if(e.key==='Escape')document.getElementById('lb').classList.remove('open');}});
+</script>
+<div class="conversation">
+"""
+
+    lines = [header]
     last_day = None
+
     for msg in messages:
-        ts = msg.get("timestamp_local") or ""
+        ts  = msg.get("timestamp_local") or ""
         day = ts[:10] if ts else "Unknown date"
 
         if day != last_day:
             try:
-                day_fmt = datetime.strptime(day, "%Y-%m-%d").strftime("%B %d, %Y")
+                day_fmt = datetime.strptime(day, "%Y-%m-%d").strftime("%B %-d, %Y")
             except Exception:
                 day_fmt = day
             lines.append(f'<div class="day-label">{day_fmt}</div>\n')
             last_day = day
 
-        side  = "me" if msg["is_from_me"] else "them"
-        extra = " reaction" if msg["is_reaction"] else ""
+        side     = "me" if msg["is_from_me"] else "them"
+        svc_cls  = " sms" if (msg.get("service") or "").upper() == "SMS" else ""
+        react_cls = " reaction" if msg["is_reaction"] else ""
         time_str = ts[11:16] if len(ts) >= 16 else ""
 
-        # Build content
         if msg["is_reaction"]:
-            label = REACTION_LABELS.get(msg["reaction_type"], f"Reaction {msg['reaction_type']}")
-            content = label
+            content = REACTION_LABELS.get(msg["reaction_type"], f"Reaction {msg['reaction_type']}")
+            raw_text = content
         else:
-            content = msg["text"] or ""
+            raw_text = msg["text"] or ""
+            # If the entire message is just a URL that has a preview, suppress the raw URL
+            previewed_urls = {og["url"] for og in msg.get("link_previews", [])}
+            stripped = raw_text.strip()
+            if stripped in previewed_urls:
+                content = ""
+            else:
+                content = raw_text
 
-        # Escape HTML
-        content = (content
-                   .replace("&", "&amp;")
-                   .replace("<", "&lt;")
-                   .replace(">", "&gt;"))
+        content = content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
         att_html = ""
         for att in msg["attachments"]:
             fname = att.get("exported_filename") or att.get("name") or "attachment"
-            mime  = att.get("mime_type", "")
-            if att.get("exported_filename"):
+            mime  = att.get("mime_type") or ""
+            ext   = fname.rsplit(".", 1)[-1].upper() if "." in fname else "FILE"
+
+            is_plugin = fname.endswith(".pluginPayloadAttachment")
+            if is_plugin:
+                att_html += f'<div class="attachment"><span class="missing">⚙️ iMessage app content (not previewable)</span></div>'
+            elif att.get("exported_filename"):
                 rel = f"attachments/{fname}"
                 if mime.startswith("image/"):
-                    att_html += f'<div class="attachment"><img class="inline" src="{rel}" alt="{fname}"></div>'
+                    att_html += f'<div class="attachment"><img class="inline" src="{rel}" alt="{fname}" onclick="lb(this.src)"></div>'
                 elif mime.startswith("video/"):
-                    att_html += f'<div class="attachment"><video class="inline" controls src="{rel}"></video></div>'
+                    att_html += f'<div class="attachment"><video class="inline" controls src="{rel}" preload="metadata"></video></div>'
+                elif mime.startswith("audio/"):
+                    att_html += f'<div class="attachment"><audio class="inline" controls src="{rel}" preload="metadata"></audio></div>'
                 else:
-                    att_html += f'<div class="attachment">📎 <a href="{rel}">{fname}</a></div>'
+                    icon = ("📄" if "pdf" in mime
+                            else "📝" if mime.startswith("text/")
+                            else "🗜" if "zip" in mime or "compressed" in mime
+                            else "📦")
+                    att_html += (f'<div class="attachment">'
+                                 f'<a class="file-card" href="{rel}" download>'
+                                 f'<span class="icon">{icon}</span>'
+                                 f'<span class="info">'
+                                 f'<span class="fname">{fname}</span>'
+                                 f'<span class="ftype">{ext}</span>'
+                                 f'</span></a></div>')
             else:
-                att_html += f'<div class="attachment">📎 {fname} <em>(not available locally)</em></div>'
+                att_html += f'<div class="attachment"><span class="missing">📎 {fname} — not available locally</span></div>'
+
+        # Build link preview cards
+        preview_html = ""
+        for og in msg.get("link_previews", []):
+            domain = re.sub(r'^https?://(www\.)?', '', og["url"]).split("/")[0]
+            img_tag = ""
+            if og.get("local_image"):
+                img_tag = f'<img class="preview-img" src="{og["local_image"]}" alt="">'
+            audio_tag = ""
+            if og.get("local_audio"):
+                audio_tag = f'<audio controls src="{og["local_audio"]}" preload="metadata"></audio>'
+            title = (og.get("title") or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            desc  = (og.get("description") or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            preview_html += (
+                f'<a class="link-preview" href="{og["url"]}" target="_blank">'
+                f'{img_tag}'
+                f'<div class="preview-body">'
+                f'<div class="preview-domain">{domain}</div>'
+                f'<div class="preview-title">{title}</div>'
+                + (f'<div class="preview-desc">{desc}</div>' if desc else '')
+                + audio_tag
+                + '</div></a>'
+            )
 
         lines.append(
-            f'<div class="bubble-row {side}{extra}">\n'
-            f'  <div>\n'
-            f'    <div class="bubble">{content}{att_html}</div>\n'
+            f'<div class="bubble-row {side}{svc_cls}{react_cls}">\n'
+            f'  <div class="bubble-wrap">\n'
+            f'    <div class="bubble">{content}{att_html}{preview_html}</div>\n'
             f'    <div class="time">{time_str}</div>\n'
             f'  </div>\n'
             f'</div>\n'
         )
 
-    lines.append("</body></html>")
+    lines.append("</div></body></html>")
     path.write_text("\n".join(lines), encoding="utf-8")
 
 def write_txt(messages: list[dict], contact: str, path: Path):
@@ -328,6 +766,8 @@ def main():
                         help="Exclude tapback/reaction messages")
     parser.add_argument("--format", choices=["all", "json", "html", "txt"], default="all",
                         help="Export format (default: all)")
+    parser.add_argument("--no-link-previews", action="store_true",
+                        help="Skip fetching link previews and downloading audio")
     args = parser.parse_args()
 
     conn = open_db()
@@ -362,6 +802,10 @@ def main():
     if attachments_total > 0:
         print("  Copying attachments…")
         messages = copy_attachments(messages, out_dir / "attachments")
+
+    # Fetch link previews
+    if not args.no_link_previews and args.format in ("all", "html"):
+        messages = fetch_link_previews(messages, out_dir)
 
     # Write exports
     fmt = args.format
