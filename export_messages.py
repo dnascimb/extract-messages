@@ -169,6 +169,34 @@ def fetch_messages(conn: sqlite3.Connection, contact: str, since_id: int = 0) ->
 
     return list(messages.values())
 
+def patch_missing_text(conn: sqlite3.Connection, messages: list[dict]) -> int:
+    """Re-fetch text from attributedBody for any messages that have empty text.
+    Returns the number of messages patched."""
+    empty_ids = [
+        m["message_id"] for m in messages
+        if not m.get("text") and not m.get("is_reaction")
+    ]
+    if not empty_ids:
+        return 0
+
+    placeholders = ",".join("?" * len(empty_ids))
+    rows = conn.execute(
+        f"SELECT ROWID, text, attributedBody FROM message WHERE ROWID IN ({placeholders})",
+        empty_ids,
+    ).fetchall()
+
+    by_id = {r["ROWID"]: r for r in rows}
+    patched = 0
+    for m in messages:
+        row = by_id.get(m["message_id"])
+        if row is None:
+            continue
+        text = row["text"] or extract_attributed_body(row["attributedBody"]) or ""
+        if text:
+            m["text"] = text
+            patched += 1
+    return patched
+
 # ── Attachment handling ─────────────────────────────────────────────────────────
 def resolve_attachment_path(raw: str) -> Path | None:
     """Expand ~/Library/... style paths returned by the DB."""
@@ -928,6 +956,9 @@ def main():
     # ── Fetch messages ──
     if is_incremental:
         existing = json.loads(existing_json.read_text())
+        patched = patch_missing_text(conn, existing)
+        if patched:
+            print(f"  Patched text for {patched} previously-empty message(s).")
         new_msgs = fetch_messages(conn, contact, since_id=last_id)
         if new_msgs:
             print(f"  Found {len(new_msgs)} new message(s) "
