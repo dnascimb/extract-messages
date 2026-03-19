@@ -233,11 +233,28 @@ def fetch_og(url: str) -> dict | None:
         "audio_url":   None,
     }
 
-    # Suno: extract audio URL from embedded MP3 reference
+    # Suno: extract audio URL and lyrics from embedded page data
     if "suno.com" in url:
         mp3 = re.search(r'https://cdn\d*\.suno\.ai/([a-f0-9\-]{36})\.mp3', html)
         if mp3:
             result["audio_url"] = f"https://cdn1.suno.ai/{mp3.group(1)}.mp3"
+        # Lyrics are stored as a React Server Components text chunk: {n}:T{hex_len},{text}
+        # The clip JSON references the prompt as "$N".
+        # Inside __next_f push strings the JSON is backslash-escaped: \"prompt\":\"$N\"
+        ref = re.search(r'(?:\\"|")prompt(?:\\"|")\s*:\s*(?:\\"|")\$(\d+)(?:\\"|")', html)
+        if ref:
+            idx = ref.group(1)
+            # Use the hex byte length to extract exactly the right slice (avoids split-boundary issues)
+            chunk_m = re.search(rf'{re.escape(idx)}:T([0-9a-f]+),', html)
+            if chunk_m:
+                byte_len = int(chunk_m.group(1), 16)
+                raw = html[chunk_m.end() : chunk_m.end() + byte_len]
+                # RSC chunks split across __next_f.push calls insert JS boilerplate mid-text;
+                # remove every occurrence of the bridge pattern.
+                raw = re.sub(r'"\]\)</script><script>self\.__next_f\.push\(\[1,"', '', raw)
+                # Unescape backslash-escaped content inside JS string literals
+                raw = raw.replace('\\"', '"').replace('\\n', '\n').replace('\\\\', '\\').strip()
+                result["lyrics"] = raw or None
 
     return result if (result["title"] or result["image_url"]) else None
 
@@ -360,6 +377,11 @@ def fetch_link_previews(messages: list[dict], out_dir: Path,
                 dest = preview_dir / f"audio_{key}.mp3"
                 if download(og["audio_url"], dest):
                     og["local_audio"] = f"previews/{dest.name}"
+            if og.get("lyrics"):
+                dest = preview_dir / f"lyrics_{key}.txt"
+                if not dest.exists():
+                    dest.write_text(og["lyrics"], encoding="utf-8")
+                og["local_lyrics"] = f"previews/{dest.name}"
 
         new_dl = sum(1 for u in new_urls if preview_cache.get(u, {}).get("local_audio"))
         print(f"  ✔ {len(new_urls)} new URL(s) processed"
@@ -631,6 +653,25 @@ def write_html(messages: list[dict], contact: str, path: Path):
     margin-top: 8px;
     display: block;
   }}
+  .lyrics-toggle {{
+    margin-top: 8px;
+    font-size: 0.75rem;
+    cursor: pointer;
+    opacity: 0.6;
+    user-select: none;
+  }}
+  .lyrics-toggle:hover {{ opacity: 1; }}
+  .lyrics-body {{
+    margin-top: 6px;
+    font-size: 0.78rem;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    opacity: 0.75;
+    max-height: 220px;
+    overflow-y: auto;
+    border-top: 1px solid var(--divider);
+    padding-top: 6px;
+  }}
 
   /* ── Lightbox ── */
   #lb {{
@@ -771,6 +812,16 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape')document.ge
                 audio_tag = f'<audio controls src="{og["local_audio"]}" preload="metadata"></audio>'
             title = (og.get("title") or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             desc  = (og.get("description") or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            lyrics_html = ""
+            if og.get("lyrics"):
+                safe_lyrics = (og["lyrics"]
+                               .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+                lyrics_html = (
+                    f'<details>'
+                    f'<summary class="lyrics-toggle">Lyrics</summary>'
+                    f'<div class="lyrics-body">{safe_lyrics}</div>'
+                    f'</details>'
+                )
             preview_html += (
                 f'<a class="link-preview" href="{og["url"]}" target="_blank">'
                 f'{img_tag}'
@@ -779,6 +830,7 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape')document.ge
                 f'<div class="preview-title">{title}</div>'
                 + (f'<div class="preview-desc">{desc}</div>' if desc else '')
                 + audio_tag
+                + lyrics_html
                 + '</div></a>'
             )
 

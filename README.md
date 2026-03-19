@@ -56,7 +56,7 @@ Open `messages.html` in a browser for a visual, bubble-style transcript.
 - **Inline media** — images, video, and audio attachments render directly in the conversation
 - **Image lightbox** — click any image to view it full-screen
 - **Link preview cards** — URLs are replaced with rich preview cards (title, thumbnail, description)
-- **Suno** — cover art and audio player embedded directly; songs play inline
+- **Suno** — cover art, audio player, and lyrics embedded directly; songs play inline with a collapsible lyrics view; lyrics saved locally to `previews/lyrics_*.txt`
 - **YouTube** — thumbnail and audio extracted via `yt-dlp` and embedded as an inline player
 - **Responsive** — adapts to desktop and mobile screen sizes
 
