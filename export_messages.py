@@ -136,6 +136,13 @@ def _fetch_messages_query(conn: sqlite3.Connection, contact: str,
                           extra_where: str, extra_params: list = []) -> list[dict]:
     """Return all messages (including attachments) for the given contact.
     If since_id > 0, only returns messages with ROWID > since_id."""
+    # thread_originator_guid was added in a later macOS version — check before selecting
+    msg_cols = {r[1] for r in conn.execute("PRAGMA table_info(message)").fetchall()}
+    reply_col = (
+        "m.thread_originator_guid AS reply_to_guid,"
+        if "thread_originator_guid" in msg_cols else
+        "NULL AS reply_to_guid,"
+    )
     rows = conn.execute(f"""
         SELECT
             m.ROWID                         AS message_id,
@@ -147,6 +154,7 @@ def _fetch_messages_query(conn: sqlite3.Connection, contact: str,
             m.attributedBody                AS attributed_body,
             m.associated_message_type       AS reaction_type,
             m.associated_message_guid       AS reaction_target,
+            {reply_col}
             m.subject                       AS subject,
             m.service                       AS service,
             a.filename                      AS attachment_filename,
@@ -184,6 +192,7 @@ def _fetch_messages_query(conn: sqlite3.Connection, contact: str,
                 "is_reaction":   r["reaction_type"] not in (0, None),
                 "reaction_type": r["reaction_type"],
                 "reaction_target": (r["reaction_target"] or "").split("/")[-1],
+                "reply_to_guid": r["reply_to_guid"] or "",
                 "attachments":   [],
             }
         # Attach file info if present
@@ -224,6 +233,29 @@ def patch_missing_text(conn: sqlite3.Connection, messages: list[dict]) -> int:
             patched += 1
     return patched
 
+def patch_missing_reply_guids(conn: sqlite3.Connection, messages: list[dict]) -> int:
+    """Back-fill reply_to_guid for messages loaded from an older messages.json.
+    Returns the number of messages patched."""
+    msg_cols = {r[1] for r in conn.execute("PRAGMA table_info(message)").fetchall()}
+    if "thread_originator_guid" not in msg_cols:
+        return 0
+    missing = [m for m in messages if "reply_to_guid" not in m]
+    if not missing:
+        return 0
+    placeholders = ",".join("?" * len(missing))
+    rows = conn.execute(
+        f"SELECT ROWID, thread_originator_guid FROM message WHERE ROWID IN ({placeholders})",
+        [m["message_id"] for m in missing],
+    ).fetchall()
+    by_id = {r["ROWID"]: r["thread_originator_guid"] or "" for r in rows}
+    patched = 0
+    for m in missing:
+        val = by_id.get(m["message_id"], "")
+        m["reply_to_guid"] = val
+        if val:
+            patched += 1
+    return patched
+
 # ── Attachment handling ─────────────────────────────────────────────────────────
 def resolve_attachment_path(raw: str) -> Path | None:
     """Expand ~/Library/... style paths returned by the DB."""
@@ -232,8 +264,23 @@ def resolve_attachment_path(raw: str) -> Path | None:
     p = Path(raw.replace("~", str(Path.home())))
     return p if p.exists() else None
 
+def _same_file_content(a: Path, b: Path) -> bool:
+    """Return True if a and b are the same file (size + first 4 KB match)."""
+    try:
+        if a.stat().st_size != b.stat().st_size:
+            return False
+        with open(a, "rb") as fa, open(b, "rb") as fb:
+            return fa.read(4096) == fb.read(4096)
+    except OSError:
+        return False
+
 def copy_attachments(messages: list[dict], dest_dir: Path) -> list[dict]:
-    """Copy every attachment into dest_dir and update paths in-place."""
+    """Copy every attachment into dest_dir and update paths in-place.
+
+    HEIC images are converted to JPEG via macOS sips for broad browser support.
+    A content check prevents accidentally reusing a same-named file from a
+    different message (common with generic names like 'PNG image.png').
+    """
     dest_dir.mkdir(parents=True, exist_ok=True)
     missing = 0
 
@@ -241,18 +288,38 @@ def copy_attachments(messages: list[dict], dest_dir: Path) -> list[dict]:
         for att in msg["attachments"]:
             src = resolve_attachment_path(att["original_path"])
             if src:
-                dst = dest_dir / src.name
-                if dst.exists():
-                    att["exported_filename"] = dst.name  # already copied
+                is_heic = src.suffix.lower() == ".heic"
+                dst_name = (src.stem + ".jpg") if is_heic else src.name
+                dst = dest_dir / dst_name
+
+                if dst.exists() and _same_file_content(src if not is_heic else src, dst):
+                    # Already correctly copied (same content)
+                    att["exported_filename"] = dst.name
+                    if is_heic:
+                        att["mime_type"] = "image/jpeg"
                 else:
-                    # Avoid name collisions with other new files
+                    # Either new file or name collision with different content
                     counter = 1
                     stem, suffix = dst.stem, dst.suffix
                     while dst.exists():
                         dst = dest_dir / f"{stem}_{counter}{suffix}"
                         counter += 1
-                    shutil.copy2(src, dst)
-                    att["exported_filename"] = dst.name
+                    if is_heic:
+                        result = subprocess.run(
+                            ["sips", "-s", "format", "jpeg", str(src), "--out", str(dst)],
+                            capture_output=True,
+                        )
+                        if result.returncode == 0 and dst.exists():
+                            att["exported_filename"] = dst.name
+                            att["mime_type"] = "image/jpeg"
+                        else:
+                            # sips failed — copy original as fallback
+                            fallback = dest_dir / src.name
+                            shutil.copy2(src, fallback)
+                            att["exported_filename"] = fallback.name
+                    else:
+                        shutil.copy2(src, dst)
+                        att["exported_filename"] = dst.name
             else:
                 att["exported_filename"] = None
                 missing += 1
@@ -269,22 +336,58 @@ YOUTUBE_RE = re.compile(r'https?://(www\.)?(youtube\.com|youtu\.be|music\.youtub
 def fetch_og(url: str) -> dict | None:
     """Fetch Open Graph metadata (and Suno audio URL) from a URL."""
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        req = urllib.request.Request(url, headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "identity",
+            "DNT": "1",
+        })
         html = urllib.request.urlopen(req, timeout=10).read().decode("utf-8", errors="ignore")
     except Exception:
         return None
 
-    def og(prop):
-        m = re.search(rf'<meta[^>]+property=["\']og:{prop}["\'][^>]+content=["\']([^"\']+)["\']', html)
-        if not m:
-            m = re.search(rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:{prop}["\']', html)
-        return m.group(1) if m else None
+    def meta_prop(prop: str) -> str | None:
+        """Match <meta property="og:X"> or <meta name="X"> in either attribute order."""
+        for attr in ("property", "name"):
+            for val in (prop, prop.replace(":", "_")):
+                m = re.search(
+                    rf'<meta[^>]+{attr}=["\'](?i:{re.escape(val)})["\'][^>]+content=["\']([^"\']+)["\']',
+                    html,
+                )
+                if not m:
+                    m = re.search(
+                        rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+{attr}=["\'](?i:{re.escape(val)})["\']',
+                        html,
+                    )
+                if m:
+                    return m.group(1)
+        return None
+
+    def og(prop: str) -> str | None:
+        return meta_prop(f"og:{prop}")
+
+    def tw(prop: str) -> str | None:
+        return meta_prop(f"twitter:{prop}")
+
+    # <title> tag fallback
+    title_tag = None
+    tm = re.search(r'<title[^>]*>([^<]{1,200})</title>', html, re.IGNORECASE)
+    if tm:
+        title_tag = tm.group(1).strip() or None
+
+    # Standard <meta name="description"> fallback
+    std_desc = meta_prop("description")
 
     result = {
         "url":         url,
-        "title":       og("title"),
-        "description": og("description"),
-        "image_url":   og("image"),
+        "title":       og("title") or tw("title") or title_tag,
+        "description": og("description") or tw("description") or std_desc,
+        "image_url":   og("image") or tw("image"),
         "audio_url":   None,
     }
 
@@ -484,6 +587,8 @@ def write_html(messages: list[dict], contact: str, path: Path):
 <style>
   *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
 
+  html {{ font-size: 36px; }}
+
   :root {{
     --bg: #f5f5f7;
     --text: #1c1c1e;
@@ -513,10 +618,9 @@ def write_html(messages: list[dict], contact: str, path: Path):
 
   body {{
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    font-size: 21px;
     background: var(--bg);
     color: var(--text);
-    padding: 0 0 48px;
+    padding: 0 0 82px;
   }}
 
 
@@ -528,20 +632,20 @@ def write_html(messages: list[dict], contact: str, path: Path):
     background: var(--bg);
     border-bottom: 1px solid var(--divider);
     text-align: center;
-    padding: 14px 16px 12px;
+    padding: 24px 27px 20px;
   }}
   .avatar {{
-    width: 52px; height: 52px;
+    width: 88px; height: 88px;
     border-radius: 50%;
     background: var(--me-blue);
     color: #fff;
     font-size: 1.3rem;
     font-weight: 600;
     display: flex; align-items: center; justify-content: center;
-    margin: 0 auto 6px;
+    margin: 0 auto 10px;
   }}
   .msg-header h1 {{ font-size: 1rem; font-weight: 600; }}
-  .msg-header .sub {{ font-size: 0.75rem; color: var(--subtext); margin-top: 2px; }}
+  .msg-header .sub {{ font-size: 0.75rem; color: var(--subtext); margin-top: 3px; }}
 
   /* ── Day label ── */
   .day-label {{
@@ -549,16 +653,16 @@ def write_html(messages: list[dict], contact: str, path: Path):
     font-size: 0.68rem;
     color: var(--subtext);
     font-weight: 500;
-    margin: 18px 0 6px;
+    margin: 31px 0 10px;
     letter-spacing: 0.04em;
   }}
 
   /* ── Bubble rows ── */
   .bubble-row {{
     display: flex;
-    padding: 2px 16px;
+    padding: 3px 27px;
     align-items: flex-end;
-    gap: 6px;
+    gap: 10px;
   }}
   .bubble-row.me   {{ justify-content: flex-end; }}
   .bubble-row.them {{ justify-content: flex-start; }}
@@ -572,35 +676,35 @@ def write_html(messages: list[dict], contact: str, path: Path):
   .them .bubble-wrap {{ align-items: flex-start; }}
 
   .bubble {{
-    padding: 10px 15px;
-    border-radius: 18px;
+    padding: 17px 26px;
+    border-radius: 31px;
     font-size: 1rem;
     line-height: 1.5;
     word-break: break-word;
     white-space: pre-wrap;
   }}
-  .me            .bubble {{ background: var(--me-blue);  color: #fff;            border-bottom-right-radius: 4px; }}
-  .me.sms        .bubble {{ background: var(--me-green); color: #fff;            border-bottom-right-radius: 4px; }}
-  .them          .bubble {{ background: var(--them-bubble); color: var(--them-text); border-bottom-left-radius: 4px; }}
-  .reaction      .bubble {{ font-size: 0.75rem; opacity: 0.6; padding: 3px 10px; border-radius: 12px; }}
+  .me            .bubble {{ background: var(--me-blue);  color: #fff;            border-bottom-right-radius: 7px; }}
+  .me.sms        .bubble {{ background: var(--me-green); color: #fff;            border-bottom-right-radius: 7px; }}
+  .them          .bubble {{ background: var(--them-bubble); color: var(--them-text); border-bottom-left-radius: 7px; }}
+  .reaction      .bubble {{ font-size: 0.75rem; opacity: 0.6; padding: 5px 17px; border-radius: 20px; }}
 
   .time {{
     font-size: 0.62rem;
     color: var(--subtext);
-    margin-top: 3px;
-    padding: 0 4px;
+    margin-top: 5px;
+    padding: 0 7px;
   }}
 
   /* ── Attachments ── */
-  .attachment {{ margin-top: 6px; line-height: 0; }}
+  .attachment {{ margin-top: 10px; line-height: 0; }}
   .attachment:first-child {{ margin-top: 0; }}
 
   img.inline {{
     max-width: 100%;
     width: auto;
-    max-height: 400px;
+    max-height: 680px;
     height: auto;
-    border-radius: 14px;
+    border-radius: 24px;
     display: block;
     cursor: zoom-in;
     object-fit: cover;
@@ -608,27 +712,27 @@ def write_html(messages: list[dict], contact: str, path: Path):
   video.inline {{
     max-width: 100%;
     width: auto;
-    max-height: 400px;
-    border-radius: 14px;
+    max-height: 680px;
+    border-radius: 24px;
     display: block;
   }}
   audio.inline {{
     max-width: 100%;
-    width: 280px;
+    width: 476px;
     display: block;
-    margin: 2px 0;
+    margin: 3px 0;
   }}
 
   .file-card {{
     display: inline-flex;
     align-items: center;
-    gap: 10px;
+    gap: 17px;
     background: var(--card-bg);
-    border-radius: 12px;
-    padding: 9px 12px;
+    border-radius: 20px;
+    padding: 15px 20px;
     text-decoration: none;
     color: inherit;
-    max-width: 240px;
+    max-width: 408px;
     transition: background 0.15s;
   }}
   .file-card:hover {{ background: var(--card-hover); }}
@@ -641,9 +745,9 @@ def write_html(messages: list[dict], contact: str, path: Path):
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    max-width: 170px;
+    max-width: 289px;
   }}
-  .file-card .ftype {{ font-size: 0.7rem; opacity: 0.55; margin-top: 1px; line-height: 1; }}
+  .file-card .ftype {{ font-size: 0.7rem; opacity: 0.55; margin-top: 2px; line-height: 1; }}
 
   .missing {{ font-size: 0.78rem; opacity: 0.45; font-style: italic; line-height: 1.4; }}
 
@@ -654,21 +758,21 @@ def write_html(messages: list[dict], contact: str, path: Path):
   }}
   .me   .bubble-outer {{ align-self: flex-end; }}
   .them .bubble-outer {{ align-self: flex-start; }}
-  .has-reactions {{ margin-bottom: 14px; }}
+  .has-reactions {{ margin-bottom: 24px; }}
   .reaction-badges {{
     position: absolute;
-    bottom: -13px;
+    bottom: -22px;
     display: flex;
-    gap: 3px;
+    gap: 5px;
     flex-wrap: wrap;
   }}
-  .me   .reaction-badges {{ left: 6px; }}
-  .them .reaction-badges {{ right: 6px; }}
+  .me   .reaction-badges {{ left: 10px; }}
+  .them .reaction-badges {{ right: 10px; }}
   .reaction-badge {{
     background: var(--bg);
     border: 1.5px solid var(--divider);
     border-radius: 999px;
-    padding: 1px 6px;
+    padding: 2px 10px;
     font-size: 0.8rem;
     white-space: nowrap;
     box-shadow: 0 1px 3px rgba(0,0,0,0.12);
@@ -678,31 +782,31 @@ def write_html(messages: list[dict], contact: str, path: Path):
   /* ── Link preview cards ── */
   .link-preview {{
     display: block;
-    border-radius: 14px;
+    border-radius: 24px;
     overflow: hidden;
     background: var(--card-bg);
     text-decoration: none;
     color: inherit;
-    margin-top: 6px;
-    max-width: 300px;
+    margin-top: 10px;
+    max-width: 510px;
     transition: opacity 0.15s;
   }}
   .link-preview:hover {{ opacity: 0.85; }}
   .link-preview .preview-img {{
     width: 100%;
-    height: 160px;
+    height: 272px;
     object-fit: cover;
     display: block;
   }}
   .link-preview .preview-body {{
-    padding: 9px 12px 11px;
+    padding: 15px 20px 19px;
   }}
   .link-preview .preview-domain {{
     font-size: 0.68rem;
     opacity: 0.5;
     text-transform: uppercase;
     letter-spacing: 0.05em;
-    margin-bottom: 3px;
+    margin-bottom: 5px;
   }}
   .link-preview .preview-title {{
     font-size: 0.9rem;
@@ -712,16 +816,16 @@ def write_html(messages: list[dict], contact: str, path: Path):
   .link-preview .preview-desc {{
     font-size: 0.78rem;
     opacity: 0.65;
-    margin-top: 3px;
+    margin-top: 5px;
     line-height: 1.35;
   }}
   .link-preview audio {{
     width: 100%;
-    margin-top: 8px;
+    margin-top: 14px;
     display: block;
   }}
   .lyrics-toggle {{
-    margin-top: 8px;
+    margin-top: 14px;
     font-size: 0.75rem;
     cursor: pointer;
     opacity: 0.6;
@@ -729,15 +833,80 @@ def write_html(messages: list[dict], contact: str, path: Path):
   }}
   .lyrics-toggle:hover {{ opacity: 1; }}
   .lyrics-body {{
-    margin-top: 6px;
+    margin-top: 10px;
     font-size: 0.78rem;
     line-height: 1.55;
     white-space: pre-wrap;
     opacity: 0.75;
-    max-height: 220px;
+    max-height: 374px;
     overflow-y: auto;
     border-top: 1px solid var(--divider);
-    padding-top: 6px;
+    padding-top: 10px;
+  }}
+
+  /* ── Reply preview ── */
+  .reply-preview {{
+    display: flex;
+    align-items: stretch;
+    border-radius: 17px;
+    overflow: hidden;
+    margin-bottom: 9px;
+    font-size: 0.82em;
+    max-width: 100%;
+  }}
+  .me .reply-preview {{
+    background: rgba(0,0,0,0.28);
+  }}
+  .them .reply-preview {{
+    background: rgba(0,0,0,0.14);
+  }}
+  @media (prefers-color-scheme: dark) {{
+    .them .reply-preview {{ background: rgba(255,255,255,0.12); }}
+  }}
+  .reply-bar {{
+    width: 5px;
+    flex-shrink: 0;
+    border-radius: 5px 0 0 5px;
+  }}
+  .me .reply-bar {{ background: rgba(255,255,255,0.85); }}
+  .them .reply-bar {{ background: #007aff; }}
+  .reply-body {{
+    padding: 9px 14px;
+    overflow: hidden;
+  }}
+  .reply-sender {{
+    font-weight: 600;
+    margin-bottom: 3px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }}
+  .reply-text {{
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    opacity: 0.9;
+  }}
+
+  /* ── Image bursts (3+ images on one message, or 3+ consecutive image-only msgs) ── */
+  .burst-grid {{
+    display: grid;
+    gap: 5px;
+    border-radius: 24px;
+    overflow: hidden;
+  }}
+  .burst-grid img.inline {{
+    width: 100%;
+    height: 187px;
+    max-height: 187px;
+    border-radius: 0;
+    object-fit: cover;
+    display: block;
+    cursor: zoom-in;
+  }}
+  .bubble-row.burst .bubble {{
+    padding: 0;
+    overflow: hidden;
   }}
 
   /* ── Lightbox ── */
@@ -745,20 +914,40 @@ def write_html(messages: list[dict], contact: str, path: Path):
     display: none;
     position: fixed;
     inset: 0;
-    background: rgba(0,0,0,0.9);
+    background: rgba(0,0,0,0.92);
     z-index: 100;
     align-items: center;
     justify-content: center;
-    cursor: zoom-out;
   }}
   #lb.open {{ display: flex; }}
-  #lb img {{ max-width: 95vw; max-height: 95vh; border-radius: 6px; object-fit: contain; }}
+  #lb-img {{ max-width: 90vw; max-height: 88vh; border-radius: 6px; object-fit: contain; display: block; }}
+  #lb-close {{
+    position: absolute; top: 27px; right: 34px;
+    color: #fff; font-size: 2rem; cursor: pointer;
+    opacity: 0.8; background: none; border: none; padding: 7px 14px; line-height: 1;
+  }}
+  #lb-close:hover {{ opacity: 1; }}
+  .lb-nav {{
+    position: absolute; top: 50%; transform: translateY(-50%);
+    background: rgba(255,255,255,0.15); border: none; color: #fff;
+    font-size: 2.2rem; cursor: pointer; padding: 17px 27px;
+    border-radius: 14px; opacity: 0.7; transition: opacity 0.15s, background 0.15s;
+    user-select: none;
+  }}
+  .lb-nav:hover {{ opacity: 1; background: rgba(255,255,255,0.28); }}
+  .lb-nav:disabled {{ opacity: 0.15; cursor: default; }}
+  #lb-prev {{ left: 20px; }}
+  #lb-next {{ right: 20px; }}
+  #lb-counter {{
+    position: absolute; bottom: 27px; left: 50%; transform: translateX(-50%);
+    color: rgba(255,255,255,0.65); font-size: 0.82rem; pointer-events: none;
+  }}
 
   /* ── Responsive ── */
-  @media (max-width: 600px) {{
+  @media (max-width: 1020px) {{
     .bubble-wrap {{ max-width: 82%; }}
-    .file-card   {{ max-width: 200px; }}
-    .file-card .fname {{ max-width: 130px; }}
+    .file-card   {{ max-width: 340px; }}
+    .file-card .fname {{ max-width: 221px; }}
   }}
 </style>
 </head>
@@ -770,12 +959,19 @@ def write_html(messages: list[dict], contact: str, path: Path):
   <div class="sub">{total:,} messages</div>
 </div>
 
-<div id="lb" onclick="this.classList.remove('open')">
+<div id="lb" onclick="if(event.target===this)lbClose()">
+  <button id="lb-prev" class="lb-nav" onclick="lbNav(-1)">&#8249;</button>
   <img id="lb-img" src="" alt="">
+  <button id="lb-next" class="lb-nav" onclick="lbNav(1)">&#8250;</button>
+  <button id="lb-close" onclick="lbClose()">&#x2715;</button>
+  <div id="lb-counter"></div>
 </div>
 <script>
-function lb(src){{document.getElementById('lb-img').src=src;document.getElementById('lb').classList.add('open');}}
-document.addEventListener('keydown',function(e){{if(e.key==='Escape')document.getElementById('lb').classList.remove('open');}});
+var lbImgs=[];var lbIdx=0;
+function lbOpen(i){{lbIdx=i;var el=document.getElementById('lb-img');el.src=lbImgs[i].src;el.alt=lbImgs[i].alt||'';document.getElementById('lb-prev').disabled=i===0;document.getElementById('lb-next').disabled=i===lbImgs.length-1;document.getElementById('lb-counter').textContent=(i+1)+' / '+lbImgs.length;document.getElementById('lb').classList.add('open');}}
+function lbClose(){{document.getElementById('lb').classList.remove('open');}}
+function lbNav(d){{var n=lbIdx+d;if(n>=0&&n<lbImgs.length)lbOpen(n);}}
+document.addEventListener('keydown',function(e){{if(!document.getElementById('lb').classList.contains('open'))return;if(e.key==='Escape')lbClose();else if(e.key==='ArrowLeft')lbNav(-1);else if(e.key==='ArrowRight')lbNav(1);}});
 </script>
 <div class="conversation">
 """
@@ -803,12 +999,58 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape')document.ge
             key = (target, original, msg["sender"])
             seen.add(key)  # prevent the original from being re-added
 
+    # ── Burst-group detection ─────────────────────────────────────────────────
+    def _is_image_only(m):
+        """True if msg has ≥1 exported image, no real text, no non-image attachments.
+        U+FFFC is the iOS placeholder inserted for each attachment slot — not real text.
+        """
+        real_atts = [a for a in m.get("attachments", [])
+                     if not (a.get("name") or "").endswith(".pluginPayloadAttachment")]
+        if not real_atts:
+            return False
+        text = (m.get("text") or "").replace("\ufffc", "").strip()
+        if text:
+            return False
+        return all(
+            (a.get("mime_type") or "").startswith("image/") and a.get("exported_filename")
+            for a in real_atts
+        )
+
+    non_rx = [m for m in messages if not m["is_reaction"]]
+    burst_lead: dict[int, list[dict]] = {}  # first-msg id → all msgs in burst
+    burst_skip: set[int] = set()            # non-first burst members to skip
+    i = 0
+    while i < len(non_rx):
+        msg = non_rx[i]
+        if _is_image_only(msg):
+            j = i + 1
+            while (j < len(non_rx)
+                   and non_rx[j]["sender"] == msg["sender"]
+                   and _is_image_only(non_rx[j])):
+                j += 1
+            if j - i >= 3:
+                grp = non_rx[i:j]
+                burst_lead[msg["message_id"]] = grp
+                for bm in grp[1:]:
+                    burst_skip.add(bm["message_id"])
+            i = j
+        else:
+            i += 1
+
+    # ── guid → message lookup (for reply previews) ───────────────────────────
+    guid_map: dict[str, dict] = {m["guid"]: m for m in messages if m.get("guid")}
+
+    # ── Gallery image list (populated during rendering) ───────────────────────
+    all_images: list[tuple[str, str]] = []  # (src, alt)
+
     lines = [header]
     last_day = None
 
     for msg in messages:
         if msg["is_reaction"]:
             continue  # rendered as badges on the target bubble, not as rows
+        if msg["message_id"] in burst_skip:
+            continue  # rendered as part of a multi-message burst below
         ts  = msg.get("timestamp_local") or ""
         day = ts[:10] if ts else "Unknown date"
 
@@ -822,11 +1064,106 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape')document.ge
 
         side    = "me" if msg["is_from_me"] else "them"
         svc_cls = " sms" if (msg.get("service") or "").upper() == "SMS" else ""
-        time_str = ts[11:16] if len(ts) >= 16 else ""
+        try:
+            time_str = datetime.strptime(ts[11:19], "%H:%M:%S").strftime("%-I:%M %p")
+        except (ValueError, IndexError):
+            time_str = ts[11:16] if len(ts) >= 16 else ""
+
+        # ── Helper: render a list of image atts as a burst grid bubble ────────
+        def _render_burst(img_atts, burst_time_str, guid):
+            n = len(img_atts)
+            cols = 2 if n == 4 else 3
+            grid_items = ""
+            for a in img_atts:
+                bfname = a.get("exported_filename") or a.get("name") or "attachment"
+                brel   = f"attachments/{bfname}"
+                bidx   = len(all_images)
+                all_images.append((brel, bfname))
+                grid_items += f'<img class="inline" src="{brel}" alt="{bfname}" onclick="lbOpen({bidx})">'
+            rxns = reactions_map.get(guid or "", [])
+            bdg = ""
+            if rxns:
+                cnts = Counter(rxns)
+                bdg = '<div class="reaction-badges">' + "".join(
+                    f'<span class="reaction-badge">{em}{" " + str(c) if c > 1 else ""}</span>'
+                    for em, c in cnts.items()
+                ) + '</div>'
+            hr_cls = " has-reactions" if rxns else ""
+            lines.append(
+                f'<div class="bubble-row {side}{svc_cls} burst">\n'
+                f'  <div class="bubble-wrap">\n'
+                f'    <div class="bubble-outer{hr_cls}">\n'
+                f'      <div class="bubble">'
+                f'<div class="burst-grid" style="grid-template-columns:repeat({cols},1fr)">'
+                f'{grid_items}</div></div>\n'
+                f'      {bdg}\n'
+                f'    </div>\n'
+                f'    <div class="time">{burst_time_str}</div>\n'
+                f'  </div>\n'
+                f'</div>\n'
+            )
+
+        # ── Multi-message burst (≥3 consecutive image-only msgs, same sender) ─
+        if msg["message_id"] in burst_lead:
+            grp = burst_lead[msg["message_id"]]
+            all_img_atts = [a for bm in grp for a in bm["attachments"]
+                            if (a.get("mime_type") or "").startswith("image/")
+                            and a.get("exported_filename")]
+            last_ts = (grp[-1].get("timestamp_local") or "")
+            try:
+                burst_time = datetime.strptime(last_ts[11:19], "%H:%M:%S").strftime("%-I:%M %p")
+            except (ValueError, IndexError):
+                burst_time = time_str
+            _render_burst(all_img_atts, burst_time,
+                          msg.get("guid", ""))
+            continue
+
+        # ── Single-message burst: ≥3 images in one message ───────────────────
+        real_img_atts = [a for a in msg["attachments"]
+                         if (a.get("mime_type") or "").startswith("image/")
+                         and a.get("exported_filename")
+                         and not (a.get("name") or "").endswith(".pluginPayloadAttachment")]
+        msg_real_text = (msg.get("text") or "").replace("\ufffc", "").strip()
+        if len(real_img_atts) >= 3 and not msg_real_text:
+            _render_burst(real_img_atts, time_str, msg.get("guid", ""))
+            continue
+
+        # ── Reply preview ─────────────────────────────────────────────────────
+        reply_html = ""
+        reply_guid = msg.get("reply_to_guid") or ""
+        if reply_guid and reply_guid in guid_map:
+            orig = guid_map[reply_guid]
+            orig_sender = "Me" if orig["is_from_me"] else contact
+            orig_text = (orig.get("text") or "").replace("\ufffc", "").strip()
+            if not orig_text:
+                # Summarise as attachment if no text
+                atts = [a for a in orig.get("attachments", [])
+                        if not (a.get("name") or "").endswith(".pluginPayloadAttachment")]
+                if atts:
+                    mime = atts[0].get("mime_type") or ""
+                    if mime.startswith("image/"):
+                        orig_text = "📷 Photo"
+                    elif mime.startswith("video/"):
+                        orig_text = "🎥 Video"
+                    elif mime.startswith("audio/"):
+                        orig_text = "🎵 Audio"
+                    else:
+                        orig_text = f"📎 {atts[0].get('name') or 'Attachment'}"
+            snippet = (orig_text[:80] + "…") if len(orig_text) > 80 else orig_text
+            esc_sender = orig_sender.replace("&", "&amp;").replace("<", "&lt;")
+            esc_snippet = snippet.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            reply_html = (
+                f'<div class="reply-preview">'
+                f'<div class="reply-bar"></div>'
+                f'<div class="reply-body">'
+                f'<div class="reply-sender">{esc_sender}</div>'
+                f'<div class="reply-text">{esc_snippet}</div>'
+                f'</div></div>'
+            )
 
         raw_text = msg["text"] or ""
         # If the entire message is just a URL that has a preview, suppress the raw URL
-        previewed_urls = {og["url"] for og in msg.get("link_previews", [])}
+        previewed_urls = {og["url"] for og in msg.get("link_previews") or []}
         stripped = raw_text.strip()
         if stripped in previewed_urls:
             content = ""
@@ -847,7 +1184,9 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape')document.ge
             elif att.get("exported_filename"):
                 rel = f"attachments/{fname}"
                 if mime.startswith("image/"):
-                    att_html += f'<div class="attachment"><img class="inline" src="{rel}" alt="{fname}" onclick="lb(this.src)"></div>'
+                    img_idx = len(all_images)
+                    all_images.append((rel, fname))
+                    att_html += f'<div class="attachment"><img class="inline" src="{rel}" alt="{fname}" onclick="lbOpen({img_idx})"></div>'
                 elif mime.startswith("video/"):
                     att_html += f'<div class="attachment"><video class="inline" controls src="{rel}" preload="metadata"></video></div>'
                 elif mime.startswith("audio/"):
@@ -869,7 +1208,7 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape')document.ge
 
         # Build link preview cards
         preview_html = ""
-        for og in msg.get("link_previews", []):
+        for og in msg.get("link_previews") or []:
             domain = re.sub(r'^https?://(www\.)?', '', og["url"]).split("/")[0]
             img_tag = ""
             if og.get("local_image"):
@@ -917,7 +1256,7 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape')document.ge
             f'<div class="bubble-row {side}{svc_cls}">\n'
             f'  <div class="bubble-wrap">\n'
             f'    <div class="bubble-outer{has_reactions_cls}">\n'
-            f'      <div class="bubble">{content}{att_html}{preview_html}</div>\n'
+            f'      <div class="bubble">{reply_html}{content}{att_html}{preview_html}</div>\n'
             f'      {badges_html}\n'
             f'    </div>\n'
             f'    <div class="time">{time_str}</div>\n'
@@ -925,7 +1264,11 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape')document.ge
             f'</div>\n'
         )
 
-    lines.append("</div></body></html>")
+    lb_srcs = ",".join(
+        '{{"src":"{s}","alt":"{a}"}}'.format(s=src, a=alt.replace('"', "&quot;"))
+        for src, alt in all_images
+    )
+    lines.append(f'</div><script>lbImgs=[{lb_srcs}];</script></body></html>')
     path.write_text("\n".join(lines), encoding="utf-8")
 
 def write_txt(messages: list[dict], contact: str, path: Path):
@@ -1000,6 +1343,9 @@ def main():
         patched = patch_missing_text(conn, existing)
         if patched:
             print(f"  Patched text for {patched} previously-empty message(s).")
+        patched_replies = patch_missing_reply_guids(conn, existing)
+        if patched_replies:
+            print(f"  Back-filled reply context for {patched_replies} message(s).")
         # Compare all DB IDs against the JSON to catch any gaps (messages that were
         # fetched in a previous run but never written to messages.json).
         json_ids = {m["message_id"] for m in existing}
@@ -1040,6 +1386,28 @@ def main():
         if atts:
             print("  Copying attachments…")
             messages = copy_attachments(messages, out_dir / "attachments")
+
+    # ── HEIC upgrade — convert any previously-exported .heic files to JPEG ──
+    att_dir = out_dir / "attachments"
+    heic_upgraded = 0
+    for m in messages:
+        for a in m["attachments"]:
+            exp = a.get("exported_filename") or ""
+            if not exp.lower().endswith(".heic"):
+                continue
+            heic_path = att_dir / exp
+            jpg_path  = heic_path.with_suffix(".jpg")
+            if not jpg_path.exists() and heic_path.exists():
+                subprocess.run(
+                    ["sips", "-s", "format", "jpeg", str(heic_path), "--out", str(jpg_path)],
+                    capture_output=True,
+                )
+            if jpg_path.exists():
+                a["exported_filename"] = jpg_path.name
+                a["mime_type"] = "image/jpeg"
+                heic_upgraded += 1
+    if heic_upgraded:
+        print(f"  Converted {heic_upgraded} existing HEIC attachment(s) to JPEG.")
 
     # ── Link previews — always run on full set so cache gaps get filled ──
     if not args.no_link_previews and args.format in ("all", "html"):

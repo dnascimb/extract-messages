@@ -268,6 +268,59 @@ class TestPreviewCache(unittest.TestCase):
         self.assertIsNone(restored["https://example.com/"])
 
 
+# ── patch_missing_reply_guids ─────────────────────────────────────────────────
+
+class TestPatchMissingReplyGuids(unittest.TestCase):
+    def _make_db(self, has_column=True):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        if has_column:
+            conn.execute(
+                "CREATE TABLE message (ROWID INTEGER PRIMARY KEY, thread_originator_guid TEXT)"
+            )
+            conn.executemany(
+                "INSERT INTO message VALUES (?, ?)",
+                [(1, "guid-abc"), (2, None), (3, "guid-xyz")],
+            )
+        else:
+            conn.execute("CREATE TABLE message (ROWID INTEGER PRIMARY KEY)")
+            conn.executemany("INSERT INTO message VALUES (?)", [(1,), (2,), (3,)])
+        conn.commit()
+        return conn
+
+    def test_backfills_missing(self):
+        """Messages without reply_to_guid key get it filled from the DB."""
+        conn = self._make_db()
+        messages = [
+            {"message_id": 1},
+            {"message_id": 2},
+        ]
+        patched = em.patch_missing_reply_guids(conn, messages)
+        self.assertEqual(patched, 1)          # only msg 1 has a non-empty guid
+        self.assertEqual(messages[0]["reply_to_guid"], "guid-abc")
+        self.assertEqual(messages[1]["reply_to_guid"], "")
+
+    def test_skips_already_set(self):
+        """Messages that already have reply_to_guid are left untouched."""
+        conn = self._make_db()
+        messages = [{"message_id": 1, "reply_to_guid": "already-set"}]
+        patched = em.patch_missing_reply_guids(conn, messages)
+        self.assertEqual(patched, 0)
+        self.assertEqual(messages[0]["reply_to_guid"], "already-set")
+
+    def test_no_op_when_column_absent(self):
+        """Returns 0 and leaves messages unchanged when column doesn't exist."""
+        conn = self._make_db(has_column=False)
+        messages = [{"message_id": 1}]
+        patched = em.patch_missing_reply_guids(conn, messages)
+        self.assertEqual(patched, 0)
+        self.assertNotIn("reply_to_guid", messages[0])
+
+    def test_empty_list(self):
+        conn = self._make_db()
+        self.assertEqual(em.patch_missing_reply_guids(conn, []), 0)
+
+
 # ── JSON always written (regression test for incremental state bug) ────────────
 
 class TestJsonAlwaysWritten(unittest.TestCase):

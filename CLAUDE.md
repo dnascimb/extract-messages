@@ -4,14 +4,16 @@
 A Python script that exports iMessage conversations from macOS's local SQLite database (`~/Library/Messages/chat.db`) into HTML, JSON, and plain-text formats, with attachment copying and rich link previews (including inline Suno and YouTube audio).
 
 ## Key Files
-- `export_messages.py` — the main (and only) script
+- `export_messages.py` — the main export script
 - `test_export.py` — unit tests (stdlib only, no external deps)
+- `analyze_messages.py` — formats exported messages into a Claude-ready transcript, saves to `claude_<task>.txt`, copies to clipboard, and opens Claude.ai
+- `analyze_messages.command` — double-clickable launcher for `analyze_messages.py`; prompts for task and date range
 
 ## Running Tests
 ```bash
 python3 test_export.py
 ```
-Run after any non-trivial change. Tests cover: `attributedBody` decoding, timestamp conversion, `patch_missing_text`, incremental fetch, `messages.json` always-written invariant, and Suno lyrics extraction (same-push and split-push RSC cases).
+Run after any non-trivial change. Tests cover: `attributedBody` decoding, timestamp conversion, `patch_missing_text`, `patch_missing_reply_guids`, incremental fetch, `messages.json` always-written invariant, and Suno lyrics extraction (same-push and split-push RSC cases).
 
 ## How to Run
 ```bash
@@ -45,6 +47,7 @@ python3 export_messages.py "+14155550100" --no-link-previews
 ## Database Schema Notes
 The script reads from `~/Library/Messages/chat.db`. Key tables:
 - `message` — every message; `is_from_me` flag; `date` is nanoseconds since 2001-01-01 UTC
+  - `thread_originator_guid` — GUID of the message being replied to (added in a later macOS version; detected at runtime via `PRAGMA table_info`)
 - `chat` — a conversation thread; identified by `chat_identifier` (phone number or email)
 - `handle` — a contact's address (phone/email)
 - `attachment` — metadata for media/files; `filename` is a `~/Library/Messages/Attachments/...` path
@@ -92,18 +95,24 @@ Stored as `associated_message_type` on the `message` row:
 - **Group chats** → `chat_identifier` for group chats is a UUID string, not a phone number; visible in `--list-contacts` output
 
 ## Link Preview System
-- `fetch_og(url)` — fetches Open Graph metadata via urllib; extracts Suno audio CDN URL from page HTML
+- `fetch_og(url)` — fetches Open Graph metadata via urllib with realistic browser headers; falls back to Twitter Card tags → `<meta name="description">` → `<title>` tag when OG tags are absent (covers most sites including eBay, Amazon, etc.). Extracts Suno audio CDN URL from page HTML.
 - `fetch_youtube(url, preview_dir)` — uses `yt-dlp --dump-json` for metadata and `-x --audio-format mp3` for audio
 - `fetch_link_previews(messages, out_dir)` — orchestrates fetching for all unique URLs; caches assets to `previews/`; annotates each message with a `link_previews` list
 - Preview assets are keyed by `abs(hash(url)) & 0xFFFFFF` for non-YouTube, or `yt_{video_id}` for YouTube
 - YouTube playlists/channels get a preview card but no audio download
 - **Cache invariant**: every URL seen is written to `preview_cache` — `None` for failures, a dict for successes. This prevents re-fetching on every run. Do not change the `if og:` guard back; it was the root cause of the "8 URLs fetched every run" bug.
+- Sites that require JavaScript rendering (Cloudflare-protected pages, heavy SPAs) will still fail; those would need a headless browser.
+
+## HTML / UI Notes
+- **Image gallery lightbox** — clicking any image opens a full-screen lightbox; prev/next arrows and keyboard (←/→/Esc) navigate all images in the conversation.
+- **Image burst grouping** — 3+ consecutive image-only messages from the same sender (or 3+ images in one message) are rendered as a CSS grid tile, matching the real Messages app.
+- **Reply threading** — messages with `thread_originator_guid` show a quoted preview of the original message inside the bubble (sender name + text snippet or media placeholder). Back-filled for existing `messages.json` via `patch_missing_reply_guids` on incremental runs.
+- **HEIC → JPEG conversion** — HEIC attachments are converted to JPEG via `sips` on copy; previously-exported `.heic` files are upgraded on the next run.
+- **Base font size** — set via `html { font-size: 36px }` (1.7× the browser default). All `rem`-based values scale with it.
 
 ## Potential Enhancements
 
 ### HTML / UI
-- **Image gallery lightbox** — clicking any image opens a full-screen lightbox that lets you scroll/arrow through *all* images in the conversation, not just the one clicked. The existing lightbox only shows one image at a time.
-- **Image burst grouping** — when 3 or more images are sent consecutively (same sender, close timestamps, no text between them), display them as a grid tile group like the real Messages app does, rather than stacking them vertically as individual bubbles.
 - **Tapback summary bar** — show all reaction types on a message as a compact row of emoji+count badges, matching the Messages popover style.
 
 ### Export / Data
