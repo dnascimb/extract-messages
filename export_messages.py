@@ -391,11 +391,20 @@ def fetch_og(url: str) -> dict | None:
         "audio_url":   None,
     }
 
-    # Suno: extract audio URL and lyrics from embedded page data
+    # Suno: extract audio URL, artist, and lyrics from embedded page data
     if "suno.com" in url:
         mp3 = re.search(r'https://cdn\d*\.suno\.ai/([a-f0-9\-]{36})\.mp3', html)
         if mp3:
             result["audio_url"] = f"https://cdn1.suno.ai/{mp3.group(1)}.mp3"
+        # Artist: find all display_name values in the page, skip model versions (v3/v4/v5…)
+        all_display = re.findall(
+            r'(?:\\"|")display_name(?:\\"|")\s*:\s*(?:\\"|")([^"\\]{1,80})(?:\\"|")', html
+        )
+        result["artist"] = next(
+            (c.strip() for c in all_display
+             if c.strip() and not re.match(r'^v\d+', c.strip(), re.IGNORECASE)),
+            None
+        )
         # Lyrics are stored as a React Server Components text chunk: {n}:T{hex_len},{text}
         # The clip JSON references the prompt as "$N".
         # Inside __next_f push strings the JSON is backslash-escaped: \"prompt\":\"$N\"
@@ -507,6 +516,84 @@ def fetch_link_previews(messages: list[dict], out_dir: Path,
         return messages, preview_cache
 
     preview_dir = out_dir / "previews"
+    att_dir     = out_dir / "attachments"
+
+    def _suno_filename(og: dict, key: int) -> str:
+        """Return a filesystem-safe name for a Suno MP3."""
+        def safe(s: str) -> str:
+            return re.sub(r'[^\w\s\-\(\)\[\]]', '', s).strip()[:60]
+        title  = safe(og.get("title")  or "")
+        artist = safe(og.get("artist") or "")
+        if artist and title:
+            return f"Suno - {artist} - {title}.mp3"
+        if title:
+            return f"Suno - {title}.mp3"
+        return f"Suno song {key}.mp3"
+
+    # ── Migrate any existing previews/audio_*.mp3 Suno files to attachments/ ──
+    for cache_url, og in list(preview_cache.items()):
+        if not og or "suno.com" not in cache_url:
+            continue
+        local = og.get("local_audio") or ""
+        if not local.startswith("previews/audio_"):
+            continue
+        src = out_dir / local
+        if not src.exists():
+            continue
+        key = abs(hash(cache_url)) & 0xFFFFFF
+        fname = _suno_filename(og, key)
+        dst = att_dir / fname
+        att_dir.mkdir(parents=True, exist_ok=True)
+        if not dst.exists():
+            shutil.move(str(src), dst)
+        elif src.resolve() != dst.resolve():
+            src.unlink(missing_ok=True)
+        og["local_audio"] = f"attachments/{dst.name}"
+
+    # ── Back-fill artist for cached Suno entries that pre-date artist extraction ──
+    # Also re-fetch entries where artist looks like a model version (v4, v5, etc.)
+    def _bad_artist(og: dict) -> bool:
+        if "artist" not in og:
+            return True
+        a = og.get("artist")
+        if a is None:
+            return True  # previous fetch returned no artist; retry
+        return bool(re.match(r'^v\d+', a, re.IGNORECASE))
+
+    suno_no_artist = [
+        u for u, og in preview_cache.items()
+        if og and "suno.com" in u and og.get("local_audio") and _bad_artist(og)
+    ]
+    if suno_no_artist:
+        print(f"  Fetching artist name for {len(suno_no_artist)} Suno song(s)…")
+        for url in suno_no_artist:
+            og = preview_cache[url]
+            refreshed = fetch_og(url)
+            artist = (refreshed or {}).get("artist")
+            raw_title = (refreshed or {}).get("title") or og.get("title") or "(no title)"
+            print(f"    {url[:70]}")
+            print(f"      title={raw_title!r}  artist={artist!r}")
+            og["artist"] = artist  # store even if None so we don't retry indefinitely
+            if refreshed and refreshed.get("title"):
+                og["title"] = refreshed["title"]  # also fix the title (strip artist suffix)
+            if artist:
+                # Rename the file to include the artist
+                old_local = og.get("local_audio") or ""
+                print(f"      local_audio={old_local!r}")
+                if old_local.startswith("attachments/"):
+                    old_path = out_dir / old_local
+                    key = abs(hash(url)) & 0xFFFFFF
+                    new_name = _suno_filename(og, key)
+                    new_path = att_dir / new_name
+                    print(f"      old_path exists={old_path.exists()}  new_name={new_name!r}")
+                    if old_path.exists() and old_path.resolve() != new_path.resolve():
+                        if not new_path.exists():
+                            old_path.rename(new_path)
+                            print(f"      renamed → {new_name}")
+                        og["local_audio"] = f"attachments/{new_name}"
+                    elif not old_path.exists():
+                        print(f"      !! old file not found at {old_path}")
+
     new_urls = [u for u in unique_urls if u not in preview_cache]
 
     if new_urls:
@@ -543,9 +630,17 @@ def fetch_link_previews(messages: list[dict], out_dir: Path,
                 if download(og["image_url"], dest):
                     og["local_image"] = f"previews/{dest.name}"
             if og.get("audio_url"):
-                dest = preview_dir / f"audio_{key}.mp3"
-                if download(og["audio_url"], dest):
-                    og["local_audio"] = f"previews/{dest.name}"
+                if "suno.com" in url:
+                    # Save to attachments/ with a human-readable name
+                    fname = _suno_filename(og, key)
+                    dest = att_dir / fname
+                    att_dir.mkdir(parents=True, exist_ok=True)
+                    if download(og["audio_url"], dest):
+                        og["local_audio"] = f"attachments/{dest.name}"
+                else:
+                    dest = preview_dir / f"audio_{key}.mp3"
+                    if download(og["audio_url"], dest):
+                        og["local_audio"] = f"previews/{dest.name}"
             if og.get("lyrics"):
                 dest = preview_dir / f"lyrics_{key}.txt"
                 if not dest.exists():
@@ -943,6 +1038,66 @@ def write_html(messages: list[dict], contact: str, path: Path):
     color: rgba(255,255,255,0.65); font-size: 0.82rem; pointer-events: none;
   }}
 
+  /* ── Search bar ── */
+  #search-bar {{
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 14px;
+    padding: 0 6px;
+  }}
+  #search-wrap {{
+    flex: 1;
+    position: relative;
+    display: flex;
+    align-items: center;
+  }}
+  #search-input {{
+    width: 100%;
+    border: none;
+    border-radius: 20px;
+    padding: 8px 36px 8px 16px;
+    font-size: 0.78rem;
+    font-family: inherit;
+    background: var(--card-bg);
+    color: var(--text);
+    outline: none;
+    transition: background 0.15s;
+  }}
+  #search-input:focus {{ background: var(--card-hover); }}
+  #search-input::placeholder {{ color: var(--subtext); }}
+  #search-clear {{
+    position: absolute; right: 10px;
+    background: none; border: none; cursor: pointer;
+    color: var(--subtext); font-size: 0.9rem; padding: 0; line-height: 1;
+    display: none;
+  }}
+  #search-clear:hover {{ color: var(--text); }}
+  #search-count {{
+    font-size: 0.65rem;
+    color: var(--subtext);
+    white-space: nowrap;
+    min-width: 52px;
+    text-align: center;
+  }}
+  .srch-nav {{
+    background: none; border: none; cursor: pointer;
+    color: var(--subtext); font-size: 1.2rem; padding: 2px 6px; line-height: 1;
+    border-radius: 6px; transition: color 0.1s;
+  }}
+  .srch-nav:hover {{ color: var(--text); }}
+  .srch-nav:disabled {{ opacity: 0.25; cursor: default; }}
+  mark {{
+    background: #ffd60a;
+    color: #000;
+    border-radius: 3px;
+    padding: 0 1px;
+  }}
+  @media (prefers-color-scheme: dark) {{
+    mark {{ background: #ff9f0a; color: #000; }}
+  }}
+  .search-hidden {{ display: none !important; }}
+
   /* ── Responsive ── */
   @media (max-width: 1020px) {{
     .bubble-wrap {{ max-width: 82%; }}
@@ -957,6 +1112,16 @@ def write_html(messages: list[dict], contact: str, path: Path):
   <div class="avatar">{avatar_letter}</div>
   <h1>{contact}</h1>
   <div class="sub">{total:,} messages</div>
+  <div id="search-bar">
+    <div id="search-wrap">
+      <input id="search-input" type="search" placeholder="Search messages…"
+             oninput="doSearch(this.value)" onkeydown="searchKey(event)" autocomplete="off">
+      <button id="search-clear" onclick="clearSearch()" title="Clear">&#x2715;</button>
+    </div>
+    <span id="search-count"></span>
+    <button class="srch-nav" id="srch-prev" onclick="searchNav(-1)" title="Previous (Shift+Enter)" disabled>&#8249;</button>
+    <button class="srch-nav" id="srch-next" onclick="searchNav(1)"  title="Next (Enter)" disabled>&#8250;</button>
+  </div>
 </div>
 
 <div id="lb" onclick="if(event.target===this)lbClose()">
@@ -971,7 +1136,63 @@ var lbImgs=[];var lbIdx=0;
 function lbOpen(i){{lbIdx=i;var el=document.getElementById('lb-img');el.src=lbImgs[i].src;el.alt=lbImgs[i].alt||'';document.getElementById('lb-prev').disabled=i===0;document.getElementById('lb-next').disabled=i===lbImgs.length-1;document.getElementById('lb-counter').textContent=(i+1)+' / '+lbImgs.length;document.getElementById('lb').classList.add('open');}}
 function lbClose(){{document.getElementById('lb').classList.remove('open');}}
 function lbNav(d){{var n=lbIdx+d;if(n>=0&&n<lbImgs.length)lbOpen(n);}}
-document.addEventListener('keydown',function(e){{if(!document.getElementById('lb').classList.contains('open'))return;if(e.key==='Escape')lbClose();else if(e.key==='ArrowLeft')lbNav(-1);else if(e.key==='ArrowRight')lbNav(1);}});
+
+var srchMatches=[],srchIdx=0;
+function escRe(s){{return s.replace(/[.*+?^${{}}()|[\\]\\\\]/g,'\\$&');}}
+function hlHTML(html,term){{var re=new RegExp('('+escRe(term)+')','gi');return html.replace(/>([^<]*)</g,function(m,t){{return '>'+t.replace(re,'<mark>$1</mark>')+'<';}});}}
+function doSearch(term){{
+  document.querySelectorAll('.bubble[data-orig]').forEach(function(b){{b.innerHTML=b.dataset.orig;delete b.dataset.orig;}});
+  srchMatches=[];
+  document.getElementById('search-clear').style.display=term?'block':'none';
+  if(!term){{
+    document.querySelectorAll('.search-hidden').forEach(function(el){{el.classList.remove('search-hidden');}});
+    document.getElementById('search-count').textContent='';
+    document.getElementById('srch-prev').disabled=true;
+    document.getElementById('srch-next').disabled=true;
+    return;
+  }}
+  var tl=term.toLowerCase();
+  document.querySelectorAll('.bubble-row').forEach(function(row){{
+    var b=row.querySelector('.bubble');
+    if(!b||b.textContent.toLowerCase().indexOf(tl)===-1){{row.classList.add('search-hidden');return;}}
+    row.classList.remove('search-hidden');
+    srchMatches.push(row);
+    b.dataset.orig=b.innerHTML;
+    b.innerHTML=hlHTML(b.innerHTML,term);
+  }});
+  document.querySelectorAll('.day-label').forEach(function(lbl){{
+    var el=lbl.nextElementSibling,vis=false;
+    while(el&&!el.classList.contains('day-label')){{
+      if(el.classList.contains('bubble-row')&&!el.classList.contains('search-hidden')){{vis=true;break;}}
+      el=el.nextElementSibling;
+    }}
+    lbl.classList.toggle('search-hidden',!vis);
+  }});
+  srchIdx=0;
+  updSrch();
+  if(srchMatches.length)srchMatches[0].scrollIntoView({{behavior:'smooth',block:'center'}});
+}}
+function updSrch(){{
+  var c=document.getElementById('search-count'),p=document.getElementById('srch-prev'),n=document.getElementById('srch-next');
+  if(!srchMatches.length){{c.textContent='No results';p.disabled=true;n.disabled=true;return;}}
+  c.textContent=(srchIdx+1)+' / '+srchMatches.length;
+  p.disabled=srchIdx===0;n.disabled=srchIdx===srchMatches.length-1;
+}}
+function searchNav(d){{
+  if(!srchMatches.length)return;
+  srchIdx=Math.max(0,Math.min(srchMatches.length-1,srchIdx+d));
+  srchMatches[srchIdx].scrollIntoView({{behavior:'smooth',block:'center'}});
+  updSrch();
+}}
+function clearSearch(){{document.getElementById('search-input').value='';doSearch('');document.getElementById('search-input').focus();}}
+function searchKey(e){{if(e.key==='Escape')clearSearch();else if(e.key==='Enter'){{e.preventDefault();searchNav(e.shiftKey?-1:1);}}}}
+document.addEventListener('keydown',function(e){{
+  if(document.getElementById('lb').classList.contains('open')){{
+    if(e.key==='Escape')lbClose();else if(e.key==='ArrowLeft')lbNav(-1);else if(e.key==='ArrowRight')lbNav(1);
+    return;
+  }}
+  if((e.metaKey||e.ctrlKey)&&e.key==='f'){{e.preventDefault();var inp=document.getElementById('search-input');inp.focus();inp.select();}}
+}});
 </script>
 <div class="conversation">
 """
